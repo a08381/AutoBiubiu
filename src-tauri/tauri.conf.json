@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AutoBiubiu",
+  "version": "0.3.0",
+  "identifier": "local.autobiubiu.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../build"
+  },
+  "app": {
+    "windows": [{
+      "label": "main",
+      "title": "AutoBiubiu · 活动助手",
+      "width": 1320,
+      "height": 820,
+      "minWidth": 900,
+      "minHeight": 640,
+      "decorations": false,
+      "backgroundColor": "#f3f6f7",
+      "dragDropEnabled": false
+    }],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost https://res.biubiu001.com https://cdn.biubiu001.com; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'",
+      "devCsp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https://res.biubiu001.com https://cdn.biubiu001.com; connect-src ipc: http://ipc.localhost ws://localhost:1420; object-src 'none'; frame-src 'none'; base-uri 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["../assets/icon.png", "../assets/icon.ico"],
+    "windows": {
+      "webviewInstallMode": { "type": "downloadBootstrapper" },
+      "nsis": { "languages": ["SimpChinese", "English"], "displayLanguageSelector": true, "installMode": "currentUser" }
+    }
+  }
+}

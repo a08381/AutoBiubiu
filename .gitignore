@@ -1,0 +1,38 @@
+# Dependencies and generated builds
+node_modules/
+/build/
+/dist/
+/target/
+/src-tauri/target/
+/src-tauri/gen/schemas/
+.vite/
+coverage/
+*.tsbuildinfo
+
+# Local activity data, verification output and historical samples
+data/
+/legacy-archive/
+/research/
+*.log
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Editor and operating-system files
+/.vscode/
+/.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+
+# Keep package-lock.json, Cargo.lock and assets/ versioned.

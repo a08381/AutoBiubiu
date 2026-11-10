@@ -1,0 +1,36 @@
+{
+  "name": "autobiubiu",
+  "version": "0.3.0",
+  "license": "MIT",
+  "description": "基于 Tauri、Rust 和 Svelte 的 Windows 本地 biubiu 活动助手",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.12.0" },
+  "scripts": {
+    "start": "node scripts/tauri.mjs dev",
+    "dev": "vite",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "build": "npm run check && vite build",
+    "test": "npm run test:frontend && npm run test:rust",
+    "test:frontend": "vitest run test/frontend.test.ts",
+    "test:rust": "node scripts/cargo.mjs test --manifest-path src-tauri/Cargo.toml",
+    "test:desktop": "node scripts/smoke-desktop.js",
+    "tauri": "node scripts/tauri.mjs",
+    "pack": "node scripts/tauri.mjs build --no-bundle",
+    "dist": "node scripts/tauri.mjs build --bundles nsis",
+    "build:icons": "node scripts/build-icons.js"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/node": "^22.0.0",
+    "svelte": "^5.0.0",
+    "svelte-check": "^4.0.0",
+    "typescript": "^5.0.0",
+    "vite": "^6.0.0",
+    "vitest": "^3.0.0"
+  }
+}
