@@ -14,11 +14,11 @@ async function fixture(t) {
   const root = await mkdtemp(path.join(tmpdir(), 'AutoBiubiu portable '));
   t.after(() => rm(root, { recursive: true, force: true }));
   const release = path.join(root, 'src-tauri/target/release');
-  const archive = path.join(release, 'AutoBiubiu_0.3.1_portable.zip');
+  const archive = path.join(release, 'AutoBiubiu_0.3.2_portable.zip');
   await mkdir(path.join(release, 'data'), { recursive: true });
   await mkdir(path.join(root, 'scripts'));
-  await writeFile(path.join(root, 'package.json'), JSON.stringify({ version: '0.3.1' }));
-  await writeFile(path.join(root, 'src-tauri/tauri.conf.json'), JSON.stringify({ productName: 'AutoBiubiu', version: '0.3.1' }));
+  await writeFile(path.join(root, 'package.json'), JSON.stringify({ version: '0.3.2' }));
+  await writeFile(path.join(root, 'src-tauri/tauri.conf.json'), JSON.stringify({ productName: 'AutoBiubiu', version: '0.3.2' }));
   await writeFile(path.join(release, 'autobiubiu.exe'), 'MZ-stale-build');
   await writeFile(path.join(release, 'data/settings.json'), 'PRIVATE-FIXTURE-DO-NOT-PACK');
   await writeFile(archive, oldZip);
@@ -69,6 +69,20 @@ test('npm dist produces portable ZIPs and preserves the NSIS command separately'
   assert.match(pkg.scripts.test, /test:packaging/);
 });
 
+test('keeps frontend, Tauri, Rust and lockfile application versions in sync', async () => {
+  const readSource = relative => readFile(new URL(relative, import.meta.url), 'utf8');
+  const pkg = JSON.parse(await readSource('../package.json'));
+  const lock = JSON.parse(await readSource('../package-lock.json'));
+  const config = JSON.parse(await readSource('../src-tauri/tauri.conf.json'));
+  const cargo = await readSource('../src-tauri/Cargo.toml');
+  const cargoLock = await readSource('../src-tauri/Cargo.lock');
+  assert.equal(config.version, pkg.version);
+  assert.equal(lock.version, pkg.version);
+  assert.equal(lock.packages[''].version, pkg.version);
+  assert.equal(cargo.match(/\[package\]\s+name = "autobiubiu"\s+version = "([^"]+)"/)?.[1], pkg.version);
+  assert.equal(cargoLock.match(/\[\[package\]\]\s+name = "autobiubiu"\s+version = "([^"]+)"/)?.[1], pkg.version);
+});
+
 test('builds first, reproduces the single-EXE folder layout, and excludes local data', async t => {
   const { root, release, archive } = await fixture(t);
   const { execute, calls } = runner();
@@ -94,8 +108,8 @@ test('respects an explicit Cargo output directory and target without packing a s
   const { execute } = runner();
   const env = { CARGO_TARGET_DIR: 'custom target', CARGO_BUILD_TARGET: 'x86_64-pc-windows-msvc' };
   const archive = await buildPortable(options(root, execute, { env }));
-  assert.equal(archive, path.join(root, 'src-tauri/custom target/x86_64-pc-windows-msvc/release/AutoBiubiu_0.3.1_portable.zip'));
-  assert.deepEqual(await readFile(path.join(release, 'AutoBiubiu_0.3.1_portable.zip')), oldZip);
+  assert.equal(archive, path.join(root, 'src-tauri/custom target/x86_64-pc-windows-msvc/release/AutoBiubiu_0.3.2_portable.zip'));
+  assert.deepEqual(await readFile(path.join(release, 'AutoBiubiu_0.3.2_portable.zip')), oldZip);
 });
 
 test('a failed build never packs the existing EXE or overwrites the previous ZIP', async t => {
@@ -136,7 +150,7 @@ test('mismatched versions and unsafe file names fail before building', async t =
   const config = path.join(root, 'src-tauri/tauri.conf.json');
   await writeFile(config, JSON.stringify({ productName: 'AutoBiubiu', version: '0.4.0' }));
   await assert.rejects(buildPortable(options(root, execute)), /版本不一致/);
-  await writeFile(config, JSON.stringify({ productName: '../AutoBiubiu', version: '0.3.1' }));
+  await writeFile(config, JSON.stringify({ productName: '../AutoBiubiu', version: '0.3.2' }));
   await assert.rejects(buildPortable(options(root, execute)), /名称或版本无效/);
   assert.equal(calls.length, 0);
 });

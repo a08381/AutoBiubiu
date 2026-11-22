@@ -18,6 +18,7 @@ export interface ActivityTask {
   awardNum?: number;
   finishCount?: number;
   supported?: boolean;
+  sharedAcceleration?: 'warframe-pc';
   reason?: string;
   gameName?: string | null;
   platformId?: number | null;

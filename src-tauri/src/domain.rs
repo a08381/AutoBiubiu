@@ -81,6 +81,14 @@ pub fn normalize_task_platforms(activities: &mut [Value]) {
             .flatten()
     }) {
         if number_is(task.get("type"), 7) {
+            // 旧缓存曾丢弃手机任务的游戏名与时长，只恢复 Warframe 的 PC 共享规则。
+            if shares_warframe_pc(task) && is_mobile(&task_text(task)) {
+                let requirement = task_requirement(task);
+                if let (Some(output), Value::Object(fields)) = (task.as_object_mut(), requirement) {
+                    output.remove("reason");
+                    output.extend(fields);
+                }
+            }
             match task_platform(task) {
                 Ok(platform) => task["platformId"] = json!(platform),
                 Err(reason) => {
@@ -150,31 +158,21 @@ pub fn parse_initial_state(html: &str) -> Result<Value, String> {
     serde_json::from_str(&capture[1]).map_err(|error| format!("活动初始数据不是有效 JSON：{error}"))
 }
 
-pub fn task_requirement(task: &Value) -> Value {
-    if !number_is(task.get("type"), 7) {
-        return json!({"supported": false, "reason": "此任务需要分享、邀请、绑定账号或其他操作"});
-    }
-    let title = text_or_empty(task.get("title"));
-    let text = format!("{} {}", title, text_or_empty(task.get("subTitle")));
-    if is_mobile(&format!(
-        "{text} {}",
+fn task_text(task: &Value) -> String {
+    format!(
+        "{} {} {}",
+        text_or_empty(task.get("title")),
+        text_or_empty(task.get("subTitle")),
         text_or_empty(task.get("description"))
-    )) {
-        return json!({"supported": false, "reason": MOBILE_REASON});
-    }
-    let platform = match task_platform(task) {
-        Ok(platform) => platform,
-        Err(reason) => return json!({"supported": false, "reason": reason}),
-    };
+    )
+}
 
-    static DURATION: OnceLock<Regex> = OnceLock::new();
+fn task_game_name(task: &Value) -> Option<String> {
+    let title = text_or_empty(task.get("title"));
+    let text = task_text(task);
     static QUOTED_NAME: OnceLock<Regex> = OnceLock::new();
     static PLAIN_NAME: OnceLock<Regex> = OnceLock::new();
     static CLEAN_NAME: OnceLock<Regex> = OnceLock::new();
-    let duration = DURATION.get_or_init(|| {
-        Regex::new(r"(?i)(?:累计)?加速[^。\n]*?([+-]?[0-9]+(?:\.[0-9]+)?)\s*(分钟|min(?:ute)?s?|小时|hours?|h|秒钟?|seconds?|s)")
-            .expect("任务时长正则表达式无效")
-    });
     let quoted_name = QUOTED_NAME
         .get_or_init(|| Regex::new(r"《([^》]+)》").expect("书名号游戏名正则表达式无效"));
     let plain_name = PLAIN_NAME.get_or_init(|| {
@@ -185,9 +183,68 @@ pub fn task_requirement(task: &Value) -> Value {
     });
     let clean_name = CLEAN_NAME.get_or_init(|| {
         Regex::new(
-            r"(?i)(?:PC端|电脑端|PS[45]?端|Xbox端|Switch端|Steam\s*Deck端|游戏|系列游戏|累计|时长)",
+            r"(?i)(?:PC端|电脑端|PS[45]?端|Xbox端|Switch端|Steam\s*Deck端|手机端|移动端|安卓端|iOS端|手游端|游戏|系列游戏|累计|时长)",
         )
         .expect("游戏名清理正则表达式无效")
+    });
+    quoted_name
+        .captures(&title)
+        .map(|capture| capture[1].to_owned())
+        .or_else(|| {
+            plain_name.captures(&title).and_then(|capture| {
+                let cleaned = clean_name.replace_all(&capture[1], "");
+                let cleaned = cleaned.strip_suffix("系列").unwrap_or(&cleaned);
+                let cleaned = cleaned.trim_matches(js_whitespace);
+                // 无游戏名的“加速10分钟”可能把数字拆成名称，继续从说明提取。
+                (!cleaned.is_empty() && cleaned.parse::<f64>().is_err()).then(|| cleaned.to_owned())
+            })
+        })
+        .or_else(|| {
+            quoted_name
+                .captures(&text)
+                .map(|capture| capture[1].to_owned())
+        })
+}
+
+fn is_warframe_name(name: &str) -> bool {
+    static PLATFORM_SUFFIX: OnceLock<Regex> = OnceLock::new();
+    let name = PLATFORM_SUFFIX
+        .get_or_init(|| {
+            Regex::new(r"(?i)\s*(?:PC端|电脑端|手机端|移动端|安卓端|iOS端|手游端)$")
+                .expect("Warframe 平台后缀正则表达式无效")
+        })
+        .replace(name, "");
+    matches!(
+        normalize_name(&name).as_str(),
+        "warframe" | "星际战甲" | "星際戰甲"
+    )
+}
+
+fn shares_warframe_pc(task: &Value) -> bool {
+    number_is(task.get("type"), 7)
+        && task_game_name(task).is_some_and(|name| is_warframe_name(&name))
+        && task_platform(task) == Ok(PC_PLATFORM)
+}
+
+pub fn task_requirement(task: &Value) -> Value {
+    if !number_is(task.get("type"), 7) {
+        return json!({"supported": false, "reason": "此任务需要分享、邀请、绑定账号或其他操作"});
+    }
+    let text = task_text(task);
+    let mobile = is_mobile(&text);
+    let warframe_pc = shares_warframe_pc(task);
+    if mobile && !warframe_pc {
+        return json!({"supported": false, "reason": MOBILE_REASON});
+    }
+    let platform = match task_platform(task) {
+        Ok(platform) => platform,
+        Err(reason) => return json!({"supported": false, "reason": reason}),
+    };
+
+    static DURATION: OnceLock<Regex> = OnceLock::new();
+    let duration = DURATION.get_or_init(|| {
+        Regex::new(r"(?i)(?:累计)?加速[^。\n]*?([+-]?[0-9]+(?:\.[0-9]+)?)\s*(分钟|min(?:ute)?s?|小时|hours?|h|秒钟?|seconds?|s)")
+            .expect("任务时长正则表达式无效")
     });
 
     // 必须从“加速”之后匹配时长，避免将游戏版本、日期和抽奖次数当作时长。
@@ -205,27 +262,26 @@ pub fn task_requirement(task: &Value) -> Value {
         let value = number * multiplier;
         seconds = Some(seconds.map_or(value, |previous| previous.max(value)));
     }
-    let name = quoted_name
-        .captures(&text)
-        .map(|capture| capture[1].to_owned())
-        .or_else(|| {
-            plain_name.captures(&title).and_then(|capture| {
-                let cleaned = clean_name.replace_all(&capture[1], "");
-                let cleaned = cleaned.strip_suffix("系列").unwrap_or(&cleaned);
-                let cleaned = cleaned.trim_matches(js_whitespace);
-                (!cleaned.is_empty()).then(|| cleaned.to_owned())
-            })
-        });
+    // 两个奖励任务使用相同的 PC 搜索名，但保留各自的任务编号和时长。
+    let name = if warframe_pc {
+        Some("Warframe".to_owned())
+    } else {
+        task_game_name(task)
+    };
     let valid_seconds = seconds
         .map(|value| value.is_finite() && value > 0.0 && value <= 86400.0)
         .unwrap_or(false);
+    let mut requirement = json!({
+        "supported": valid_seconds && name.is_some(),
+        "gameName": name, "seconds": seconds.map(number_value), "platformId": platform
+    });
     if !valid_seconds || name.is_none() {
-        return json!({
-            "supported": false, "reason": REQUIREMENT_REASON,
-            "gameName": name, "seconds": seconds.map(number_value), "platformId": platform
-        });
+        requirement["reason"] = json!(REQUIREMENT_REASON);
     }
-    json!({"supported": true, "gameName": name, "seconds": seconds.map(number_value), "platformId": platform})
+    if mobile && warframe_pc {
+        requirement["sharedAcceleration"] = json!("warframe-pc");
+    }
+    requirement
 }
 
 pub fn simplify_activity(entry: &Value, info: &Value, config: &Value) -> Result<Value, String> {
@@ -273,10 +329,21 @@ pub fn simplify_activity(entry: &Value, info: &Value, config: &Value) -> Result<
                 .filter(|value| !value.is_null())
                 .cloned()
                 .unwrap_or_else(|| json!(format!("type-{}", optional_id(task.get("type")))));
+            // 保留所有说明文字，避免解析成功后在缓存、规划阶段丢失游戏名或移动端要求。
+            let description = if truthy_field(task, "description").is_some() {
+                json!(format!(
+                    "{} {}",
+                    text_or_empty(task.get("subTitle")),
+                    text_or_empty(task.get("description"))
+                )
+                .trim_matches(js_whitespace))
+            } else {
+                truthy_field(task, "subTitle").cloned().unwrap_or(json!(""))
+            };
             let mut simplified = json!({
                 "id": task_id,
                 "title": truthy_field(task, "title").cloned().unwrap_or(json!("")),
-                "description": truthy_field(task, "subTitle").cloned().unwrap_or(json!("")),
+                "description": description,
                 "finishCount": truthy_field(task, "finishCount").cloned().unwrap_or(json!(0))
             });
             for key in ["type", "status", "awardNum"] {
@@ -393,15 +460,9 @@ pub fn build_plan(
                 .filter(|value| !value.is_null())
                 .or_else(|| task.get("seconds"))
                 .and_then(Value::as_f64);
-            let mobile_text = format!(
-                "{} {} {}",
-                text_or_empty(task.get("title")),
-                text_or_empty(task.get("description")),
-                text_or_empty(task.get("subTitle"))
-            );
-            let mobile = is_mobile(&mobile_text);
+            let mobile = is_mobile(&task_text(task)) && !shares_warframe_pc(task);
             let manual = truthy(field("manual")) && !mobile;
-            // 手工映射也不把手机端任务转成 PC 任务；显式错误时长不回退。
+            // 仅 Warframe 的移动奖励共用 PC 加速，其他手机任务仍不能手工转成 PC。
             if mobile
                 || (!truthy(task.get("supported")) && !manual)
                 || !truthy(field("gameId"))
@@ -904,6 +965,79 @@ mod tests {
     }
 
     #[test]
+    fn warframe_mobile_rewards_use_the_same_pc_requirement() {
+        for name in ["Warframe", "WARFRAME", "星际战甲", "星際戰甲"] {
+            for suffix in ["手机端", "移动端", "安卓端", "iOS端", "手游端"] {
+                for title in [
+                    format!("每天加速{name}{suffix}超10分钟"),
+                    format!("加速《{name}》{suffix}10min"),
+                    format!("加速《{name}{suffix}》10min"),
+                ] {
+                    let requirement = task_requirement(&json!({"type":7,"title":title}));
+                    assert_eq!(
+                        requirement,
+                        json!({
+                            "supported":true,"gameName":"Warframe","seconds":600,
+                            "platformId":6,"sharedAcceleration":"warframe-pc"
+                        }),
+                        "{title}"
+                    );
+                }
+            }
+            assert_eq!(
+                task_requirement(&json!({"type":7,"title":format!("加速《{name}》PC端5分钟")})),
+                json!({"supported":true,"gameName":"Warframe","seconds":300,"platformId":6})
+            );
+        }
+    }
+
+    #[test]
+    fn warframe_pc_sharing_does_not_match_unrelated_or_console_tasks() {
+        for task in [
+            json!({"type":7,"title":"加速《Warframe攻略》手机端10分钟"}),
+            json!({"type":7,"title":"加速《其他游戏》手机端10分钟","subTitle":"Warframe 活动"}),
+            json!({"type":7,"title":"加速其他游戏手机端10分钟","subTitle":"奖励来自《Warframe》"}),
+            json!({"type":7,"title":"加速《Warframe》手机端 PS5 10分钟"}),
+            json!({"type":7,"title":"加速《Warframe》手机端10分钟","platformId":9}),
+            json!({"type":11,"title":"绑定《Warframe》手机端"}),
+        ] {
+            assert_eq!(task_requirement(&task)["supported"], false, "{task}");
+            assert!(task_requirement(&task).get("sharedAcceleration").is_none());
+        }
+        for (hint, platform) in [("PS5", 8), ("Xbox", 9)] {
+            let requirement = task_requirement(
+                &json!({"type":7,"title":format!("加速《Warframe》 {hint} 10分钟")}),
+            );
+            assert_eq!(requirement["platformId"], platform);
+            assert!(requirement.get("sharedAcceleration").is_none());
+        }
+        let invalid = task_requirement(&json!({"type":7,"title":"加速《Warframe》手机端0分钟"}));
+        assert_eq!(invalid["supported"], false);
+        assert_eq!(invalid["reason"], REQUIREMENT_REASON);
+    }
+
+    #[test]
+    fn old_warframe_mobile_cache_recovers_requirements_without_changing_other_tasks() {
+        let other = json!({"id":2,"type":7,"title":"加速《边狱公司》手机端10分钟","supported":false,"reason":MOBILE_REASON});
+        let mut activities = [json!({"id":"a","tasks":[
+            {"id":1,"type":7,"title":"Warframe","description":"加速《Warframe》移动端10分钟","status":2,"supported":false,"reason":MOBILE_REASON},
+            other
+        ]})];
+        normalize_task_platforms(&mut activities);
+        let task = &activities[0]["tasks"][0];
+        assert_eq!(task["id"], 1);
+        assert_eq!(task["status"], 2);
+        assert_eq!(task["supported"], true);
+        assert_eq!(task["gameName"], "Warframe");
+        assert_eq!(task["seconds"], 600);
+        assert_eq!(task["platformId"], 6);
+        assert_eq!(task["sharedAcceleration"], "warframe-pc");
+        assert!(task.get("reason").is_none());
+        assert_eq!(activities[0]["tasks"][1]["supported"], false);
+        assert_eq!(activities[0]["tasks"][1]["reason"], MOBILE_REASON);
+    }
+
+    #[test]
     fn requirement_takes_maximum_duration_and_supports_units() {
         for (unit, multiplier) in [
             ("分钟", 60),
@@ -1184,6 +1318,115 @@ mod tests {
         assert_eq!(plan["totalSeconds"], 600);
         assert_eq!(plan["groups"][0]["id"], "1:auto");
         assert_eq!(plan["groups"][0]["tasks"].as_array().unwrap().len(), 2);
+    }
+
+    fn warframe_activity() -> Value {
+        simplify_activity(
+            &json!({"activeLink":public_url("warframe"),"activeName":"Warframe"}),
+            &json!({"startTime":1,"endTime":NOW + 86400000,"tasks":[
+                {"taskId":101,"type":7,"status":1,"title":"加速《Warframe》PC端5分钟"},
+                {"taskId":"mobile-202","type":7,"status":1,"title":"加速《Warframe》手机端10分钟"}
+            ]}),
+            &json!({}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn warframe_pc_and_mobile_rewards_share_one_pc_group_with_original_ids() {
+        let plan = build_plan(
+            &[warframe_activity()],
+            &json!({
+                "warframe:101":{"gameId":42,"gameName":"Warframe","platformId":6},
+                "warframe:mobile-202":{"gameId":42,"gameName":"Warframe","platformId":6}
+            }),
+            None,
+            NOW,
+        );
+        assert_eq!(plan["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(plan["totalSeconds"], 600);
+        let group = &plan["groups"][0];
+        assert_eq!(group["platformId"], 6);
+        assert_eq!(group["gameId"], 42);
+        assert_eq!(group["tasks"][0]["taskId"], 101);
+        assert_eq!(group["tasks"][0]["seconds"], 300);
+        assert_eq!(group["tasks"][1]["taskId"], "mobile-202");
+        assert_eq!(group["tasks"][1]["seconds"], 600);
+        assert_eq!(plan["skipped"], json!([]));
+    }
+
+    #[test]
+    fn warframe_mobile_description_survives_simplification_cache_and_planning() {
+        for (subtitle, description) in [
+            ("", "加速《Warframe》手机端10分钟"),
+            ("每日奖励", "加速《Warframe》手机端10分钟"),
+            ("加速《Warframe》手机端10分钟", "每日奖励"),
+        ] {
+            let mut activity = simplify_activity(
+                &json!({"activeLink":public_url("warframe")}),
+                &json!({"tasks":[{
+                    "taskId":"mobile-202","type":7,"status":1,"title":"每天累计加速10分钟",
+                    "subTitle":subtitle,"description":description
+                }]}),
+                &json!({}),
+            )
+            .unwrap();
+            let task = &activity["tasks"][0];
+            assert_eq!(task["supported"], true);
+            assert_eq!(task["sharedAcceleration"], "warframe-pc");
+            assert!(task["description"].as_str().unwrap().contains("Warframe"));
+            normalize_task_platforms(std::slice::from_mut(&mut activity));
+            let plan = build_plan(
+                &[activity],
+                &json!({"warframe:mobile-202":{"gameId":42,"platformId":6}}),
+                None,
+                NOW,
+            );
+            assert_eq!(plan["totalSeconds"], 600);
+            assert_eq!(plan["groups"][0]["platformId"], 6);
+            assert_eq!(plan["groups"][0]["tasks"][0]["taskId"], "mobile-202");
+            assert_eq!(plan["skipped"], json!([]));
+        }
+    }
+
+    #[test]
+    fn warframe_mobile_ready_reward_needs_no_acceleration_after_pc_is_claimed() {
+        let mut activity = warframe_activity();
+        activity["tasks"][0]["status"] = json!(3);
+        activity["tasks"][1]["status"] = json!(2);
+        let plan = build_plan(
+            &[activity],
+            &json!({"warframe:mobile-202":{"gameId":42,"platformId":6}}),
+            None,
+            NOW,
+        );
+        assert_eq!(plan["totalSeconds"], 0);
+        assert_eq!(plan["groups"][0]["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(plan["groups"][0]["tasks"][0]["taskId"], "mobile-202");
+    }
+
+    #[test]
+    fn warframe_sharing_keeps_areas_separate_and_rejects_mobile_or_console_mappings() {
+        let plan = build_plan(
+            &[warframe_activity()],
+            &json!({
+                "warframe:101":{"gameId":42,"areaId":1,"platformId":6},
+                "warframe:mobile-202":{"gameId":42,"areaId":2,"platformId":6}
+            }),
+            None,
+            NOW,
+        );
+        assert_eq!(plan["groups"].as_array().unwrap().len(), 2);
+        assert_eq!(plan["totalSeconds"], 900);
+        for platform in [1, 8, 9] {
+            let plan = build_plan(
+                &[warframe_activity()],
+                &json!({"warframe:mobile-202":{"gameId":42,"platformId":platform,"manual":true}}),
+                None,
+                NOW,
+            );
+            assert_eq!(plan["groups"], json!([]));
+        }
     }
 
     #[test]

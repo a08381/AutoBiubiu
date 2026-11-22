@@ -46,7 +46,8 @@ export function taskKey(activityId: string, taskId: TaskId): string {
 }
 
 export function canConfigure(task: ActivityTask): boolean {
-  return task.type === 7 && !/手机端|移动端|安卓端|iOS端|手游端/i.test(`${task.title} ${task.description ?? ''}`);
+  return task.type === 7 && (task.sharedAcceleration === 'warframe-pc' && taskPlatformId(task) === PC_PLATFORM_ID
+    || !/手机端|移动端|安卓端|iOS端|手游端/i.test(`${task.title} ${task.description ?? ''}`));
 }
 
 function isPlatformId(value: number): value is PlatformId {
@@ -79,12 +80,13 @@ export function mappingDescription(task: ActivityTask, mapping?: GameMapping): s
   const platformId = taskPlatformId(task);
   if (platformId === undefined) return TASK_PLATFORM_REFRESH;
   const label = platformLabel(platformId);
+  const shared = task.sharedAcceleration === 'warframe-pc' ? ' · 移动版奖励共用 Warframe PC 加速' : '';
   if (mapping) {
     if (!matchesPlatform(mapping.platformId, platformId)) return `${label} · ${MAPPING_PLATFORM_REFRESH}`;
     const seconds = mapping.seconds ?? task.seconds;
-    return `${label} · ${mapping.gameName} · ${mapping.areaName || '上次 / 默认区服'} · ${seconds == null ? '时长待设置' : `${seconds / 60} 分钟`}`;
+    return `${label} · ${mapping.gameName} · ${mapping.areaName || '上次 / 默认区服'} · ${seconds == null ? '时长待设置' : `${seconds / 60} 分钟`}${shared}`;
   }
-  return `${label} · ${task.reason || '待匹配游戏，请选择游戏、区服和时长'}`;
+  return `${label} · ${task.reason || '待匹配游戏，请选择游戏、区服和时长'}${shared}`;
 }
 
 export function errorMessage(error: unknown): string {

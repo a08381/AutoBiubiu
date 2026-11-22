@@ -157,6 +157,19 @@ describe('前端格式化与输入校验', () => {
     expect(canConfigure(task({ description: '移动端任务' }))).toBe(false);
   });
 
+  it('仅根据后端标记开放 Warframe 移动奖励的 PC 配置并说明共享加速', () => {
+    const mobile = task({ title: '加速《Warframe》手机端10分钟', platformId: 6, sharedAcceleration: 'warframe-pc' });
+    expect(canConfigure(mobile)).toBe(true);
+    expect(taskPlatformId(mobile)).toBe(6);
+    expect(mappingDescription(mobile)).toContain('移动版奖励共用 Warframe PC 加速');
+    const mapping: GameMapping = { gameId: 42, gameName: 'Warframe', platformId: 6, seconds: 600 };
+    expect(mappingDescription(mobile, mapping)).toBe('PC · Warframe · 上次 / 默认区服 · 10 分钟 · 移动版奖励共用 Warframe PC 加速');
+    expect(canConfigure(task({ title: mobile.title }))).toBe(false);
+    expect(canConfigure({ ...mobile, type: 11 })).toBe(false);
+    expect(canConfigure({ ...mobile, platformId: 8 })).toBe(false);
+    expect(mappingDescription(mobile, { ...mapping, platformId: 9 })).toContain('旧映射需重新匹配');
+  });
+
   it('使用官方平台编号；有主机提示的旧任务不默认成 PC', () => {
     expect(taskPlatformId(task())).toBe(6);
     expect(taskPlatformId(task({ title: '加速《FPS 游戏》' }))).toBe(6);
@@ -226,7 +239,7 @@ describe('桌面 IPC 契约', () => {
   });
 
   it('状态读取只调用 get_state，搜索保留 action 与 payload 结构', async () => {
-    const snapshot = { version: '0.3.1', run: { status: 'idle' } };
+    const snapshot = { version: '0.3.2', run: { status: 'idle' } };
     desktop.invoke.mockResolvedValueOnce(snapshot).mockResolvedValueOnce([]);
     expect(await getState()).toEqual(snapshot);
     expect(desktop.invoke).toHaveBeenNthCalledWith(1, 'get_state', undefined);
