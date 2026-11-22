@@ -25,7 +25,12 @@ pub trait Service: Send {
     async fn connect_session(&mut self, id: &str) -> Result<(), String>;
     async fn refresh(&mut self, id: &str) -> Result<Value, String>;
     async fn status(&mut self) -> Result<Value, String>;
-    async fn start_game(&mut self, id: i64, area: Option<i64>) -> Result<Value, String>;
+    async fn start_game(
+        &mut self,
+        id: i64,
+        area: Option<i64>,
+        platform: i64,
+    ) -> Result<Value, String>;
     async fn stop_game(&mut self, id: i64) -> Result<(), String>;
     async fn claim(&mut self, id: &str, task: &Value) -> Result<Value, ApiError>;
     async fn draw(&mut self, id: &str) -> Result<Value, ApiError>;
@@ -51,7 +56,17 @@ impl Service for Backend {
                 self.add_url(text(payload, "url")?).await?;
                 Ok(json!({"ok":true}))
             }
-            "search" => Ok(json!(self.search(text(payload, "keyword")?).await?)),
+            "search" => {
+                let platform = payload
+                    .get("platformId")
+                    .filter(|value| !value.is_null())
+                    .map_or(Ok(crate::domain::PC_PLATFORM), |value| {
+                        value.as_i64().ok_or("游戏搜索平台无效")
+                    })?;
+                Ok(json!(
+                    self.search(text(payload, "keyword")?, platform).await?
+                ))
+            }
             "mapping" => {
                 self.set_mapping(payload).await?;
                 Ok(json!({"ok":true}))
@@ -72,8 +87,13 @@ impl Service for Backend {
     async fn status(&mut self) -> Result<Value, String> {
         Backend::status(self).await
     }
-    async fn start_game(&mut self, id: i64, area: Option<i64>) -> Result<Value, String> {
-        Backend::start_game(self, id, area).await
+    async fn start_game(
+        &mut self,
+        id: i64,
+        area: Option<i64>,
+        platform: i64,
+    ) -> Result<Value, String> {
+        Backend::start_game(self, id, area, platform).await
     }
     async fn stop_game(&mut self, id: i64) -> Result<(), String> {
         Backend::stop_game(self, id).await
@@ -514,8 +534,15 @@ impl Engine {
     async fn accelerate(&self, group: &Value, mut pending: Vec<Value>) -> Result<(), String> {
         self.assert_running().await?;
         let id = group["gameId"].as_i64().ok_or("游戏编号无效")?;
+        let platform = group["platformId"]
+            .as_i64()
+            .unwrap_or(crate::domain::PC_PLATFORM);
         self.log(
-            format!("开始加速 {}", group["gameName"].as_str().unwrap_or("游戏")),
+            format!(
+                "开始加速 {}（{}）",
+                group["gameName"].as_str().unwrap_or("游戏"),
+                crate::domain::platform_name(platform)
+            ),
             "info",
         )
         .await?;
@@ -523,8 +550,14 @@ impl Engine {
             .service
             .lock()
             .await
-            .start_game(id, group["areaId"].as_i64())
+            .start_game(id, group["areaId"].as_i64(), platform)
             .await?;
+        let area = group["areaId"]
+            .as_i64()
+            .or_else(|| previous["areaId"].as_i64());
+        if !crate::domain::acceleration_matches(&previous, id, platform, area) {
+            return Err("客户端返回的加速游戏、平台或区服与任务不符".to_owned());
+        }
         let mut wall = now_ms();
         let mut mono = Instant::now();
         let mut elapsed = 0.0;
@@ -535,8 +568,8 @@ impl Engine {
             let current = self.service.lock().await.status().await?;
             let next_wall = now_ms();
             let next_mono = Instant::now();
-            if current["active"] != true || current["gameId"].as_i64() != Some(id) {
-                return Err("加速中断或游戏已切换，停止累计时间".to_owned());
+            if !crate::domain::acceleration_matches(&current, id, platform, area) {
+                return Err("加速中断或游戏、平台、区服已切换，停止累计时间".to_owned());
             }
             elapsed += valid_interval(
                 &previous,
@@ -996,7 +1029,12 @@ mod tests {
             let data = self.0.data.lock().unwrap();
             Ok(json!({"active":data.active,"gameId":42,"gameName":"测试游戏"}))
         }
-        async fn start_game(&mut self, _id: i64, _area: Option<i64>) -> Result<Value, String> {
+        async fn start_game(
+            &mut self,
+            _id: i64,
+            _area: Option<i64>,
+            _platform: i64,
+        ) -> Result<Value, String> {
             let mut data = self.0.data.lock().unwrap();
             data.events.push("start".to_owned());
             data.active = true;

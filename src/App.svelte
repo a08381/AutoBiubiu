@@ -8,8 +8,12 @@
   import RecordList from './lib/RecordList.svelte';
   import { filterActivities, focusedActivity } from './lib/workspace';
   import { dispatch, getState, openDataDir, openExternal, requestExit } from './lib/ipc';
-  import { duration, errorMessage, formatTime, taskKey, validateActivityUrl } from './lib/format';
-  import type { Activity, ActivityTask, DispatchRequest, MutationRequest, RunStatus, SearchGame, Snapshot } from './lib/types';
+  import {
+    canConfigure, duration, errorMessage, formatTime, matchesPlatform, MAPPING_PLATFORM_REFRESH, platformLabel,
+    taskKey, taskPlatformId, TASK_PLATFORM_REFRESH, validateActivityUrl,
+  } from './lib/format';
+  import { PC_PLATFORM_ID, type Activity, type ActivityTask, type DispatchRequest, type MutationRequest,
+    type RunStatus, type SearchGame, type Snapshot } from './lib/types';
 
   type DialogName = 'mapping' | 'import' | 'reconcile';
   type UtilityAction = 'external' | 'directory' | 'exit';
@@ -85,9 +89,15 @@
     ...group.tasks.filter((task) => selected.has(task.activityId)).map((task) => task.status === 2 ? 0 : task.seconds)), 0) / 60));
   const logs = $derived([...(run?.logs ?? [])].reverse());
   const rewards = $derived([...(run?.results ?? [])].reverse());
-  const currentGame = $derived(games.find((game) => String(game.id) === gameId));
+  const mappingTask = $derived(mappingTarget ? activities.find((activity) => activity.id === mappingTarget?.activity.id)
+    ?.tasks.find((task) => task.id === mappingTarget?.task.id) : undefined);
+  const mappingPlatformId = $derived(mappingTask && canConfigure(mappingTask) ? taskPlatformId(mappingTask) : undefined);
+  const matchingGames = $derived(games.filter((game) => matchesPlatform(game.platformId, mappingPlatformId)));
+  const currentGame = $derived(matchingGames.find((game) => String(game.id) === gameId));
   const currentMapping = $derived(mappingTarget
     ? snapshot?.mappings[taskKey(mappingTarget.activity.id, mappingTarget.task.id)] : undefined);
+  const savedMapping = $derived(currentMapping && matchesPlatform(currentMapping.platformId, mappingPlatformId)
+    ? currentMapping : undefined);
   const pendingActivity = $derived(activities.find((activity) => activity.id === run?.pending?.activityId));
   const pendingKey = $derived(JSON.stringify(run?.pending ?? null));
   const reconcileChanged = $derived(reconcileKey !== pendingKey);
@@ -97,7 +107,8 @@
     ? snapshot.connection.loggedIn ? '客户端已连接 · 已登录' : '客户端已连接 · 请登录'
     : '尚未连接客户端');
   const runTitle = $derived(run?.status === 'running' && run.group
-    ? `正在加速 · ${run.group.gameName}` : run ? statusLabels[run.status] || run.status : '读取运行状态');
+    ? `正在加速 · ${platformLabel(run.group.platformId ?? PC_PLATFORM_ID)} · ${run.group.gameName}`
+    : run ? statusLabels[run.status] || run.status : '读取运行状态');
   const runDetail = $derived(run?.status === 'running'
     ? `本组 ${run.group?.tasks.length ?? 0} 个任务 · 达标后等待 20 秒结算缓冲，再核对并领取`
     : run?.status === 'stopping' ? '正在等待当前请求结束并停止加速，请稍候。'
@@ -258,7 +269,8 @@
     if (editingLocked) return;
     mappingEpoch += 1;
     mappingTarget = { activity, task };
-    const mapping = snapshot?.mappings[taskKey(activity.id, task.id)];
+    const cachedMapping = snapshot?.mappings[taskKey(activity.id, task.id)];
+    const mapping = cachedMapping && matchesPlatform(cachedMapping.platformId, taskPlatformId(task)) ? cachedMapping : undefined;
     gameQuery = mapping?.gameName || task.gameName || '';
     minutes = (mapping?.seconds ?? task.seconds ?? 600) / 60;
     mappingError = '';
@@ -276,13 +288,17 @@
       report('请先连接客户端，并等待当前操作完成后搜索。', 'mapping');
       return;
     }
+    const platformId = mappingPlatformId;
+    if (platformId === undefined) {
+      report(TASK_PLATFORM_REFRESH, 'mapping');
+      return;
+    }
     const keyword = gameQuery.trim();
     if (!keyword || keyword.length > 80) {
       report('请输入 1–80 个字符的游戏名称。', 'mapping');
       return;
     }
     const epoch = mappingEpoch;
-    const mapping = currentMapping;
     busyAction = 'search';
     mappingError = '';
     mainError = '';
@@ -291,14 +307,17 @@
     areaId = '';
     searched = false;
     try {
-      const result = await dispatch({ action: 'search', payload: { keyword } });
-      if (!mounted || epoch !== mappingEpoch || !mappingDialog?.open) return;
+      const result = await dispatch({ action: 'search', payload: { keyword, platformId } });
+      if (!mounted || epoch !== mappingEpoch || !mappingDialog?.open || mappingPlatformId !== platformId) return;
       games = result;
       searched = true;
-      const chosen = result.find((game) => game.id === mapping?.gameId) ?? result[0];
+      const mapping = savedMapping;
+      const savedGame = mapping ? matchingGames.find((game) => game.id === mapping.gameId) : undefined;
+      const chosen = savedGame ?? matchingGames[0];
       gameId = chosen ? String(chosen.id) : '';
-      areaId = chosen?.areas.some((area) => area.areaId === mapping?.areaId) ? String(mapping?.areaId) : '';
-      if (!result.length) report('未找到游戏，请换个名称搜索。', 'mapping');
+      areaId = mapping?.areaId != null && savedGame?.areas.some((area) => area.areaId === mapping.areaId)
+        ? String(mapping.areaId) : '';
+      if (!matchingGames.length) report(`未找到 ${platformLabel(platformId)} 游戏，请换个名称搜索。`, 'mapping');
     } catch (error: unknown) {
       if (mounted && epoch === mappingEpoch && mappingDialog?.open) report(error, 'mapping');
     } finally {
@@ -308,8 +327,12 @@
 
   async function saveMapping(): Promise<void> {
     if (!mappingTarget) return;
+    if (mappingPlatformId === undefined) {
+      report(TASK_PLATFORM_REFRESH, 'mapping');
+      return;
+    }
     if (!currentGame || !Number.isInteger(currentGame.id) || currentGame.id <= 0) {
-      report('请先搜索并选择一个 PC 游戏。', 'mapping');
+      report(`请先搜索并选择 ${platformLabel(mappingPlatformId)} 游戏。`, 'mapping');
       return;
     }
     if (areaId && !currentGame.areas.some((area) => String(area.areaId) === areaId)) {
@@ -387,7 +410,7 @@
       <div class="rail-spacer"></div>
       <button type="button" class:current={page === 'settings'} aria-current={page === 'settings' ? 'page' : undefined}
         title="设置" onclick={() => { page = 'settings'; }}><Icon name="settings" size={22} /><span>设置</span></button>
-      <span class="rail-version">v{snapshot?.version || '0.3.0'}</span>
+      <span class="rail-version">v{snapshot?.version || '0.3.1'}</span>
     </nav>
 
     <main class="workspace">
@@ -537,7 +560,7 @@
           <div class="setting-row"><span class="setting-icon"><Icon name="monitor" size={21} /></span><div class="setting-copy"><h3>关闭窗口时收起到托盘</h3><p>任务保持运行；需要完全退出时，使用下方的“退出应用”。</p></div><span class="setting-value">已启用</span></div>
           <div class="setting-row"><span class="setting-icon"><Icon name="clock" size={21} /></span><div class="setting-copy"><h3>计时与任务规则</h3><p>同一游戏、同一区服合并计时，以活动服务器的完成状态为准。手机端、邀请和游戏内任务需手动完成。</p></div></div>
           <div class="setting-row"><span class="setting-icon"><Icon name="power" size={21} /></span><div class="setting-copy"><h3>退出应用</h3><p>由桌面后台确认退出、停止加速并保存记录。</p></div><button type="button" class="secondary" disabled={utilityBusy !== null} onclick={() => utility('exit')}>{utilityBusy === 'exit' ? '正在退出…' : '退出应用'}</button></div>
-          <div class="about-app"><span class="app-symbol"><Icon name="arrow" size={20} /></span><strong>AutoBiubiu</strong><span>版本 {snapshot?.version || '0.3.0'} · 本地活动助手</span><p>让等待有个好结果。</p></div>
+          <div class="about-app"><span class="app-symbol"><Icon name="arrow" size={20} /></span><strong>AutoBiubiu</strong><span>版本 {snapshot?.version || '0.3.1'} · 本地活动助手</span><p>让等待有个好结果。</p></div>
         </section>
       {/if}
     </main>
@@ -565,20 +588,25 @@
 <dialog bind:this={mappingDialog} aria-labelledby="mapping-title" aria-describedby="mapping-task"
   onclose={() => { mappingEpoch += 1; }}>
   <button type="button" class="dialog-close" aria-label="关闭游戏设置窗口" onclick={() => mappingDialog?.close()}>×</button>
-  <h2 id="mapping-title">选择游戏和区服</h2><p id="mapping-task" class="muted">{mappingTarget?.task.title}</p>
-  {#if currentMapping}<p class="muted">已保存：{currentMapping.gameName} · {currentMapping.areaName || '上次 / 默认区服'}</p>{/if}
+  <h2 id="mapping-title">选择游戏和区服</h2><p id="mapping-task" class="muted">{mappingTask?.title ?? mappingTarget?.task.title}</p>
+  {#if mappingPlatformId !== undefined}<p class="muted">任务平台：{platformLabel(mappingPlatformId)}</p>{/if}
+  {#if savedMapping}
+    <p class="muted">已保存：{platformLabel(mappingPlatformId)} · {savedMapping.gameName} · {savedMapping.areaName || '上次 / 默认区服'}</p>
+  {:else if currentMapping && mappingPlatformId !== undefined}
+    <p class="muted">{MAPPING_PLATFORM_REFRESH}</p>
+  {/if}
   <form novalidate onsubmit={(event) => { event.preventDefault(); void searchGames(); }}>
     <label class="field" for="game-query">游戏名称</label>
-    <div class="search-row"><input id="game-query" bind:value={gameQuery} maxlength="80" placeholder="输入 PC 游戏名称" disabled={editingLocked} />
-      <button type="submit" class="secondary" disabled={editingLocked || !connected}>{busyAction === 'search' ? '搜索中…' : '搜索'}</button></div>
+    <div class="search-row"><input id="game-query" bind:value={gameQuery} maxlength="80" placeholder="输入游戏名称" disabled={editingLocked || mappingPlatformId === undefined} />
+      <button type="submit" class="secondary" disabled={editingLocked || !connected || mappingPlatformId === undefined}>{busyAction === 'search' ? '搜索中…' : '搜索'}</button></div>
   </form>
-  <p class="muted">{!connected ? '请关闭此窗口并先点击“连接客户端”，再搜索游戏。' : searched ? `找到 ${games.length} 个游戏，请核对游戏和区服。` : '点击搜索后读取游戏及区服列表，打开此窗口不会自动连接。'}</p>
+  <p class="muted">{mappingPlatformId === undefined ? TASK_PLATFORM_REFRESH : !connected ? '请关闭此窗口并先点击“连接客户端”，再搜索游戏。' : searched ? `找到 ${matchingGames.length} 个游戏，请核对游戏和区服。` : '点击搜索后读取游戏及区服列表，打开此窗口不会自动连接。'}</p>
   <form novalidate onsubmit={(event) => { event.preventDefault(); void saveMapping(); }}>
     <label class="field" for="game-select">游戏</label>
-    <select id="game-select" class="full" bind:value={gameId} disabled={editingLocked || !games.length}
+    <select id="game-select" class="full" bind:value={gameId} disabled={editingLocked || !matchingGames.length}
       onchange={() => { areaId = ''; }}>
-      <option value="" disabled>请先搜索并选择 PC 游戏</option>
-      {#each games as game (game.id)}<option value={String(game.id)}>{game.name}{game.english ? ` · ${game.english}` : ''}</option>{/each}
+      <option value="" disabled>请先搜索并选择游戏</option>
+      {#each matchingGames as game (game.id)}<option value={String(game.id)}>{platformLabel(mappingPlatformId)} · {game.name}{game.english ? ` · ${game.english}` : ''}</option>{/each}
     </select>
     <label class="field" for="area-select">区服</label>
     <select id="area-select" class="full" bind:value={areaId} disabled={editingLocked || !currentGame}>

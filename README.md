@@ -11,10 +11,14 @@
 ## 功能与边界
 
 - 读取客户端活动中心、导入官方活动链接，区分公开规则、缓存信息与已核对的账号进度。
-- 自动执行可识别的 PC 加速时长任务，支持游戏、区服和时长设置；邀请、绑定、手机加速等任务仅展示说明。
-- 按游戏与区服合并任务，每 5 秒核对实际加速状态；达标后等待 20 秒结算，再读取服务端状态。
+- 自动执行 PC 客户端内可识别的 PC、PS、Xbox、Switch 和 Steam Deck 加速时长任务，按任务平台搜索游戏；邀请、绑定、手机加速等任务仅展示说明。
+- 按平台、游戏与区服合并任务，每 5 秒核对实际加速状态；达标后等待 20 秒结算，再读取服务端状态。
 - 展示奖励、执行日志及北京时间的会员到期时间；支持搜索、筛选、浅色/深色主题和托盘运行。
 - 领取或抽奖结果不明时保留待核对记录，不自动重复提交。最终是否达标、获得奖励，以官方活动服务返回为准。
+
+## 下载 Windows 预编译二进制文件
+
+从 [Release](https://github.com/a08381/AutoBiubiu/releases/latest) 下载最新的二进制文件，解压后运行
 
 ## 从源码启动
 
@@ -45,8 +49,10 @@ npm start
 1. 启动后打开 **设置 → biubiu 客户端**，确认安装目录或完整 EXE 路径、调试端口，点击 **保存客户端设置**。默认端口为 `9222`，仅连接本机 `127.0.0.1`；识别和保存不会启动客户端。
 2. 点击右上角 **连接客户端**，按需完成 UAC 确认。若现有客户端需要重启以启用调试，会先弹出确认；重启会中断当前加速。
 3. 点击 **刷新活动与进度** 读取账号状态。**更新公开内容** 只读取公开规则，不能代替账号进度核对；也可使用 **导入链接** 添加活动。
-4. 勾选活动，在详情中设置 PC 游戏、区服和时长，点击 **开始所选活动**。运行中可随时点击 **停止任务**；待核对记录应先在官方页面确认，再点击 **已核对，重新读取**。
+4. 勾选活动，在详情中设置对应平台的游戏、区服和时长，点击 **开始所选活动**。运行中可随时点击 **停止任务**；待核对记录应先在官方页面确认，再点击 **已核对，重新读取**。
 5. 关闭窗口会收起到托盘，后台队列继续运行。完全退出请用 **设置 → 退出应用** 或托盘菜单 **退出**，应用会处理任务停止和记录保存。
+
+升级后请点击一次 **刷新活动与进度**，重新解析游戏映射。旧版本将 PS/Xbox 任务映射到 PC 游戏的记录会在刷新时移除并按正确平台重新搜索，不会继续累计错误平台的时长；找不到唯一结果时需要手动选择。PS 与 Xbox 任务分别执行，不共享计时。
 
 搜索和筛选不会清空选择，“全选本列表”只影响当前可见活动。运行任务、处理请求或存在待核对记录、遗留加速时，客户端配置保持锁定。切换账号或会员信息变化后，可点击会员到期时间旁的刷新按钮。
 
@@ -76,9 +82,10 @@ npm start
 
 ```powershell
 npm run build                 # 类型检查并构建前端
-npm test                      # 前端与 Rust 单元测试
+npm test                      # 前端、Rust 与便携包打包测试
 npm run pack                  # 构建 release EXE
-npm run dist                  # 构建 NSIS 安装包
+npm run dist                  # 构建 release EXE 并生成便携 ZIP
+npm run dist:nsis              # 构建 NSIS 安装包
 ```
 
 | 命令 | 产物或用途 |
@@ -86,10 +93,16 @@ npm run dist                  # 构建 NSIS 安装包
 | `npm run check` | Svelte / TypeScript 检查 |
 | `npm run test:frontend` | Vitest 前端测试 |
 | `npm run test:rust` | Cargo 后端测试 |
+| `npm run test:packaging` | 便携包结构、版本、失败保护与 Windows ZIP 校验测试 |
 | `npm run build` | 前端产物 `build\`，不是独立桌面应用 |
 | `npm run pack` | `src-tauri\target\release\autobiubiu.exe` |
-| `npm run dist` | `src-tauri\target\release\bundle\nsis\` 下的安装包 |
+| `npm run dist` | `src-tauri\target\release\AutoBiubiu_<version>_portable.zip` |
+| `npm run dist:nsis` | `src-tauri\target\release\bundle\nsis\` 下的安装包 |
 | `npm run build:icons` | 重新生成受版本控制的 PNG / ICO 图标 |
+
+`npm run dist` 需要在 Windows 上运行，使用系统自带的 Windows PowerShell / .NET 压缩，无需额外安装 ZIP 工具。它先构建当前源码的 release EXE，再生成仅含 `AutoBiubiu/AutoBiubiu.exe` 的 ZIP，校验解压内容与构建 EXE 的 SHA-256 一致后替换同名旧包；构建或压缩失败时保留旧包。版本号取自 `tauri.conf.json`，并核对其与 `package.json` 一致。设置 `CARGO_TARGET_DIR` 或 `CARGO_BUILD_TARGET` 时，产物放在对应 Cargo 输出目录的 `release` 下。
+
+便携包不包含个人 `data`、配置、日志或 WebView2 运行时。解压后运行 `AutoBiubiu.exe`；数据目录首次运行时自动创建。升级时先退出旧版，只替换 EXE 并保留原 `data` 目录。系统需要已安装 WebView2 Runtime。
 
 NSIS 安装范围为当前 Windows 用户，必要时下载 WebView2 bootstrapper；目前产物未配置代码签名。依赖版本由 [package-lock.json](package-lock.json) 与 [Cargo.lock](src-tauri/Cargo.lock) 固定，二者都应提交。
 

@@ -1,4 +1,9 @@
-import type { ActivityTask, GameMapping, TaskId, Timestamp } from './types';
+import { PC_PLATFORM_ID, type ActivityTask, type GameMapping, type PlatformId, type TaskId, type Timestamp } from './types';
+
+const platformLabels: Record<PlatformId, string> = { 6: 'PC', 7: 'Switch', 8: 'PlayStation', 9: 'Xbox', 10: 'Steam Deck' };
+const legacyConsoleHint = /主机|游戏机|\b(?:ps[45]?|playstation[45]?|xbox(?:one|series[xs]?|360)?|switch|steam[\s-]*deck)\b/i;
+export const TASK_PLATFORM_REFRESH = '任务平台待确认，请更新公开内容或刷新活动与进度。';
+export const MAPPING_PLATFORM_REFRESH = '旧映射需重新匹配，请刷新活动后重新设置游戏。';
 
 const dateTime = new Intl.DateTimeFormat('zh-CN', {
   timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
@@ -44,6 +49,25 @@ export function canConfigure(task: ActivityTask): boolean {
   return task.type === 7 && !/手机端|移动端|安卓端|iOS端|手游端/i.test(`${task.title} ${task.description ?? ''}`);
 }
 
+function isPlatformId(value: number): value is PlatformId {
+  return Object.hasOwn(platformLabels, value);
+}
+
+export function platformLabel(platformId?: number | null): string {
+  return platformId != null && isPlatformId(platformId) ? platformLabels[platformId] : '平台待确认';
+}
+
+export function taskPlatformId(task: ActivityTask): PlatformId | undefined {
+  if (task.platformId != null) return isPlatformId(task.platformId) ? task.platformId : undefined;
+  const text = `${task.title} ${task.description ?? ''}`.normalize('NFKC');
+  // Only the backend assigns console IDs; an old console snapshot must be refreshed, not searched as PC.
+  return legacyConsoleHint.test(text) ? undefined : PC_PLATFORM_ID;
+}
+
+export function matchesPlatform(candidate: number | null | undefined, required: PlatformId | undefined): boolean {
+  return required !== undefined && (candidate ?? PC_PLATFORM_ID) === required;
+}
+
 export function taskStatus(task: ActivityTask): string {
   if (task.status === 3) return '已领取';
   if (task.status === 2) return '可领取';
@@ -52,11 +76,15 @@ export function taskStatus(task: ActivityTask): string {
 
 export function mappingDescription(task: ActivityTask, mapping?: GameMapping): string {
   if (!canConfigure(task)) return task.reason || task.description || '此任务需手动完成';
+  const platformId = taskPlatformId(task);
+  if (platformId === undefined) return TASK_PLATFORM_REFRESH;
+  const label = platformLabel(platformId);
   if (mapping) {
+    if (!matchesPlatform(mapping.platformId, platformId)) return `${label} · ${MAPPING_PLATFORM_REFRESH}`;
     const seconds = mapping.seconds ?? task.seconds;
-    return `${mapping.gameName} · ${mapping.areaName || '上次 / 默认区服'} · ${seconds == null ? '时长待设置' : `${seconds / 60} 分钟`}`;
+    return `${label} · ${mapping.gameName} · ${mapping.areaName || '上次 / 默认区服'} · ${seconds == null ? '时长待设置' : `${seconds / 60} 分钟`}`;
   }
-  return task.reason || '待匹配游戏，请选择游戏、区服和时长';
+  return `${label} · ${task.reason || '待匹配游戏，请选择游戏、区服和时长'}`;
 }
 
 export function errorMessage(error: unknown): string {

@@ -1,6 +1,6 @@
 [package]
 name = "autobiubiu"
-version = "0.3.0"
+version = "0.3.1"
 license = "MIT"
 description = "Windows 本地 biubiu 活动助手"
 edition = "2021"

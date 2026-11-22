@@ -13,6 +13,85 @@ pub const ROUTE: &str = "/activity/activityTemplate";
 const MOBILE_REASON: &str = "这是手机端加速任务，PC 客户端不计入";
 const REQUIREMENT_REASON: &str = "请在任务设置中指定游戏和加速分钟数";
 
+pub const PC_PLATFORM: i64 = 6;
+
+pub fn supported_platform(platform: i64) -> bool {
+    matches!(platform, 6..=10)
+}
+
+pub fn platform_name(platform: i64) -> &'static str {
+    match platform {
+        6 => "PC",
+        7 => "Switch",
+        8 => "PS",
+        9 => "Xbox",
+        10 => "Steam Deck",
+        _ => "未知平台",
+    }
+}
+
+pub fn task_platform(task: &Value) -> Result<i64, String> {
+    let text = format!(
+        "{} {} {}",
+        text_or_empty(task.get("title")),
+        text_or_empty(task.get("subTitle")),
+        text_or_empty(task.get("description"))
+    );
+    static QUOTED: OnceLock<Regex> = OnceLock::new();
+    let text = QUOTED
+        .get_or_init(|| Regex::new(r"《[^》]*》").expect("游戏名正则表达式无效"))
+        .replace_all(&text, "");
+    static PLATFORMS: OnceLock<Vec<(i64, Regex)>> = OnceLock::new();
+    let platforms = PLATFORMS.get_or_init(|| {
+        [
+            (7, r"(?i)Switch|任天堂"),
+            (8, r"(?i)PS[45]?\s*(?:端|主机|平台)|\bPS[45]?\b|PlayStation"),
+            (9, r"(?i)Xbox"),
+            (10, r"(?i)Steam\s*Deck"),
+        ]
+        .into_iter()
+        .map(|(id, pattern)| (id, Regex::new(pattern).expect("任务平台正则表达式无效")))
+        .collect()
+    });
+    let matched: Vec<i64> = platforms
+        .iter()
+        .filter(|(_, pattern)| pattern.is_match(&text))
+        .map(|(id, _)| *id)
+        .collect();
+    match matched.as_slice() {
+        [platform] => Ok(*platform),
+        [] if text.contains("主机") => Err("主机任务的平台不明确，请确认任务要求".to_owned()),
+        [] => match task.get("platformId").filter(|value| !value.is_null()) {
+            Some(value) => value
+                .as_i64()
+                .filter(|platform| supported_platform(*platform))
+                .ok_or_else(|| "任务平台无效，请刷新活动".to_owned()),
+            None => Ok(PC_PLATFORM),
+        },
+        _ => Err("任务包含多个主机平台，无法合并计时，请确认任务要求".to_owned()),
+    }
+}
+
+pub fn normalize_task_platforms(activities: &mut [Value]) {
+    for task in activities.iter_mut().flat_map(|activity| {
+        activity
+            .get_mut("tasks")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+    }) {
+        if number_is(task.get("type"), 7) {
+            match task_platform(task) {
+                Ok(platform) => task["platformId"] = json!(platform),
+                Err(reason) => {
+                    task["supported"] = json!(false);
+                    task["reason"] = json!(reason);
+                }
+            }
+        }
+    }
+}
+
 pub fn activity_id(url: &str) -> Result<String, String> {
     let parsed = Url::parse(url).map_err(|_| "不支持的活动页面".to_owned())?;
     // URL 解析器可能消去空的 userinfo，原文中的 @ 也需要检查。
@@ -77,9 +156,16 @@ pub fn task_requirement(task: &Value) -> Value {
     }
     let title = text_or_empty(task.get("title"));
     let text = format!("{} {}", title, text_or_empty(task.get("subTitle")));
-    if is_mobile(&text) {
+    if is_mobile(&format!(
+        "{text} {}",
+        text_or_empty(task.get("description"))
+    )) {
         return json!({"supported": false, "reason": MOBILE_REASON});
     }
+    let platform = match task_platform(task) {
+        Ok(platform) => platform,
+        Err(reason) => return json!({"supported": false, "reason": reason}),
+    };
 
     static DURATION: OnceLock<Regex> = OnceLock::new();
     static QUOTED_NAME: OnceLock<Regex> = OnceLock::new();
@@ -98,8 +184,10 @@ pub fn task_requirement(task: &Value) -> Value {
         .expect("游戏名正则表达式无效")
     });
     let clean_name = CLEAN_NAME.get_or_init(|| {
-        Regex::new(r"(?i)(?:PC端|电脑端|游戏|系列游戏|累计|时长)")
-            .expect("游戏名清理正则表达式无效")
+        Regex::new(
+            r"(?i)(?:PC端|电脑端|PS[45]?端|Xbox端|Switch端|Steam\s*Deck端|游戏|系列游戏|累计|时长)",
+        )
+        .expect("游戏名清理正则表达式无效")
     });
 
     // 必须从“加速”之后匹配时长，避免将游戏版本、日期和抽奖次数当作时长。
@@ -134,10 +222,10 @@ pub fn task_requirement(task: &Value) -> Value {
     if !valid_seconds || name.is_none() {
         return json!({
             "supported": false, "reason": REQUIREMENT_REASON,
-            "gameName": name, "seconds": seconds.map(number_value)
+            "gameName": name, "seconds": seconds.map(number_value), "platformId": platform
         });
     }
-    json!({"supported": true, "gameName": name, "seconds": seconds.map(number_value)})
+    json!({"supported": true, "gameName": name, "seconds": seconds.map(number_value), "platformId": platform})
 }
 
 pub fn simplify_activity(entry: &Value, info: &Value, config: &Value) -> Result<Value, String> {
@@ -331,18 +419,38 @@ pub fn build_plan(
                 skipped.push(json!({"key": key, "reason": reason}));
                 continue;
             }
+            let platform = match task_platform(task) {
+                Ok(platform) => platform,
+                Err(reason) => {
+                    skipped.push(json!({"key": key, "reason": reason}));
+                    continue;
+                }
+            };
+            let mapped_platform = field("platformId")
+                .filter(|value| !value.is_null())
+                .map_or(Some(PC_PLATFORM), Value::as_i64);
+            if mapped_platform != Some(platform) {
+                skipped.push(json!({"key": key, "reason": format!(
+                    "游戏映射与任务要求的 {} 平台不符，请刷新活动或重新设置", platform_name(platform)
+                )}));
+                continue;
+            }
             let seconds = seconds.unwrap_or(0.0);
             let area = field("areaId").filter(|value| truthy(Some(value)));
-            let group_key = format!(
+            let mut group_key = format!(
                 "{}:{}",
                 optional_id(field("gameId")),
                 area.map(value_id).unwrap_or_else(|| "auto".to_owned())
             );
+            if platform != PC_PLATFORM {
+                group_key = format!("{platform}:{group_key}");
+            }
             let index = match indices.get(&group_key) {
                 Some(index) => *index,
                 None => {
                     let index = groups.len();
-                    let mut group = json!({"id": group_key, "tasks": [], "seconds": 0});
+                    let mut group =
+                        json!({"id": group_key, "tasks": [], "seconds": 0, "platformId": platform});
                     for name in ["gameId", "areaId", "gameName"] {
                         insert_present(&mut group, name, field(name));
                     }
@@ -399,6 +507,22 @@ pub fn day_key(time: i64) -> String {
         .single()
         .map(|date| date.with_timezone(&shanghai).format("%Y-%m-%d").to_string())
         .unwrap_or_default()
+}
+
+pub fn acceleration_matches(
+    status: &Value,
+    game_id: i64,
+    platform: i64,
+    area_id: Option<i64>,
+) -> bool {
+    let actual_platform = status
+        .get("platformId")
+        .filter(|value| !value.is_null())
+        .map_or(Some(PC_PLATFORM), Value::as_i64);
+    status["active"] == true
+        && number_is(status.get("gameId"), game_id)
+        && actual_platform == Some(platform)
+        && area_id.is_none_or(|area| number_is(status.get("areaId"), area))
 }
 
 pub fn valid_interval(
@@ -748,7 +872,7 @@ mod tests {
         ] {
             assert_eq!(
                 task_requirement(&json!({"type":7,"title":title,"subTitle":"获得1次抽奖机会"})),
-                json!({"supported":true,"gameName":name,"seconds":seconds}),
+                json!({"supported":true,"gameName":name,"seconds":seconds,"platformId":6}),
                 "{title}"
             );
         }
@@ -809,7 +933,7 @@ mod tests {
     fn requirement_preserves_unresolved_fields_and_rejects_invalid_lengths() {
         assert_eq!(
             task_requirement(&json!({"type":7,"title":"加速任意游戏"})),
-            json!({"supported":false,"reason":REQUIREMENT_REASON,"gameName":null,"seconds":null})
+            json!({"supported":false,"reason":REQUIREMENT_REASON,"gameName":null,"seconds":null,"platformId":6})
         );
         for title in [
             "加速《游戏》0分钟",
@@ -859,7 +983,7 @@ mod tests {
         assert_eq!(
             result["tasks"][0],
             json!({"id":123,"type":7,"status":2,"title":"加速《游戏》10min",
-            "description":"获得1次抽奖机会","awardNum":2,"finishCount":1,"supported":true,"gameName":"游戏","seconds":600})
+            "description":"获得1次抽奖机会","awardNum":2,"finishCount":1,"supported":true,"gameName":"游戏","seconds":600,"platformId":6})
         );
         assert_eq!(result["tasks"][1]["id"], "00123");
         assert_eq!(result["tasks"][2]["id"], "type-11");
@@ -959,6 +1083,93 @@ mod tests {
         );
         let duplicate = [candidates[0].clone(), candidates[0].clone()];
         assert!(choose_game("游戏一", &duplicate).is_none());
+    }
+
+    #[test]
+    fn requirement_distinguishes_console_tasks_from_the_pc_client() {
+        for (suffix, platform) in [
+            ("PS端", 8),
+            ("Xbox端", 9),
+            ("Switch端", 7),
+            ("Steam Deck端", 10),
+        ] {
+            let task = json!({"type":7,"title":format!("加速《GTA6》{suffix}10min"),
+                "subTitle":format!("使用biubiu加速器（PC端）累计加速《GTA6》{suffix}10min")});
+            let requirement = task_requirement(&task);
+            assert_eq!(requirement["supported"], true);
+            assert_eq!(requirement["platformId"], platform);
+            assert_eq!(requirement["gameName"], "GTA6");
+            assert_eq!(requirement["seconds"], 600);
+        }
+        assert_eq!(
+            task_platform(&json!({"title":"加速《Xbox PC Game Pass》PC端10min"})).unwrap(),
+            6
+        );
+        assert!(task_platform(&json!({"title":"加速《GTA6》PS端或Xbox端10min"})).is_err());
+        assert!(task_platform(&json!({"title":"加速《GTA6》主机端10min"})).is_err());
+        assert_eq!(
+            task_requirement(&json!({"type":7,"title":"加速《游戏》10min","description":"手机端"}))
+                ["supported"],
+            false
+        );
+    }
+
+    #[test]
+    fn cached_console_tasks_reject_legacy_pc_mappings_even_when_manual() {
+        let mut tasks = vec![json!({"id":"gta","tasks":[
+            {"id":1,"type":7,"status":1,"title":"加速《GTA6》PS端10min","supported":true,"seconds":600},
+            {"id":2,"type":7,"status":1,"title":"加速《GTA6》Xbox端10min","supported":true,"seconds":600}
+        ]})];
+        normalize_task_platforms(&mut tasks);
+        assert_eq!(tasks[0]["tasks"][0]["platformId"], 8);
+        assert_eq!(tasks[0]["tasks"][1]["platformId"], 9);
+        for manual in [false, true] {
+            let plan = build_plan(
+                &tasks,
+                &json!({
+                    "gta:1":{"gameId":11001121,"manual":manual},
+                    "gta:2":{"gameId":11001121,"platformId":6,"manual":manual}
+                }),
+                None,
+                NOW,
+            );
+            assert_eq!(plan["groups"], json!([]));
+            assert_eq!(plan["skipped"].as_array().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn console_platforms_have_separate_groups_and_durations() {
+        let mut ps = activity("ps", 600, 1);
+        ps["tasks"][0]["platformId"] = json!(8);
+        let mut xbox = activity("xbox", 600, 1);
+        xbox["tasks"][0]["platformId"] = json!(9);
+        let plan = build_plan(
+            &[ps, xbox],
+            &json!({
+                "ps:1":{"gameId":42,"platformId":8},
+                "xbox:1":{"gameId":42,"platformId":9}
+            }),
+            None,
+            NOW,
+        );
+        assert_eq!(plan["groups"].as_array().unwrap().len(), 2);
+        assert_eq!(plan["groups"][0]["platformId"], 8);
+        assert_eq!(plan["groups"][1]["platformId"], 9);
+        assert_ne!(plan["groups"][0]["id"], plan["groups"][1]["id"]);
+        assert_eq!(plan["totalSeconds"], 1200);
+    }
+
+    #[test]
+    fn acceleration_requires_the_requested_platform_and_area() {
+        let status = json!({"active":true,"gameId":42,"platformId":8,"areaId":7});
+        assert!(acceleration_matches(&status, 42, 8, Some(7)));
+        assert!(!acceleration_matches(&status, 42, 9, Some(7)));
+        assert!(!acceleration_matches(&status, 42, 8, Some(8)));
+        assert!(!acceleration_matches(&status, 41, 8, Some(7)));
+        let legacy = json!({"active":true,"gameId":42});
+        assert!(acceleration_matches(&legacy, 42, 6, None));
+        assert!(!acceleration_matches(&legacy, 42, 8, None));
     }
 
     #[test]

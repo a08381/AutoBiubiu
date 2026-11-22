@@ -61,7 +61,7 @@ flowchart LR
 | `get_active_center_info` | 读取活动中心条目 |
 | `get-user-info` | 检查登录状态，并只提取会员到期时间与会员类型 |
 | `update-user-info` | 用户点击会员刷新时，让客户端更新账号资料 |
-| `search-game-list-combine` | 搜索 PC 游戏 |
+| `search-game-list-combine` | 按任务的 `searchPlatformIds` 搜索对应平台游戏 |
 | `get-games-by-ids`、`get-local-game-config` | 读取游戏、区服与加速模式 |
 | `start-accelerate`、`get-accelerate-data`、`stop-accelerate` | 启动、核对与停止实际加速 |
 | `open-webview` | 打开活动页面并沿用客户端会话 |
@@ -79,6 +79,14 @@ flowchart LR
 空闲、启动等待和停止重置可能返回 `{ bytes: 0, code: undefined, msg: "" }`，CDP 序列化后会省略 `code`，不能把缺字段当作成功。即使没有 `code`，仍保留 `checkSpeedUpInfo` 中的限制原因。
 
 默认节点为 `{ id: "auto", displayName: "智能节点", type: 1 }`。停止操作仅针对本应用记录为拥有的加速任务。
+
+### 游戏平台与主机任务
+
+客户端游戏目录的平台编号为 PC `6`、Switch `7`、PS `8`、Xbox `9`、Steam Deck `10`。任务描述中的“使用 PC 客户端”不等于目标游戏是 PC 版；明确的 PS/Xbox 等游戏端标记优先。平台不明确的主机任务不会默认为 PC。
+
+平台随活动任务、游戏搜索结果、持久化映射、计划分组和实际加速状态一同传递。搜索只请求并接收对应平台；设置映射及启动前再次核对 `gameInfo.platformId`。启动沿用目录中的完整 `gameData` 与可用的 `speedupModelList`，不硬编码 GTA 游戏编号或主机加速模式。成功状态从 `gameData.gameInfo.platformId` 提取平台，计时同时核对游戏、平台与区服。
+
+旧映射缺少 `platformId` 时仅按旧版 PC 映射处理。刷新活动时删除与任务平台不符的旧映射（包括手动映射）并重新搜索；尚未刷新时计划会拒绝使用这些错误映射。PS 与 Xbox 分组隔离，不能共用同一次加速的时长。
 
 ### 会员状态
 
@@ -112,10 +120,10 @@ https://www.biubiu001.com/activity/activityTemplate?activityUuid=<活动编号>
 
 ## 任务执行与结果核对
 
-自动计划仅处理可识别的 `type: 7` PC 加速时长任务；邀请、访问页面、绑定、手机加速及游戏内时间只展示说明。任务状态以服务端字段为准，历史累计 `finishCount` 不单独代表当日完成。
+自动计划仅处理 PC 客户端中可识别的 `type: 7` 加速时长任务，包括明确要求 PS/Xbox 等平台的主机任务；邀请、访问页面、绑定、手机加速及游戏内时间只展示说明。任务状态以服务端字段为准，历史累计 `finishCount` 不单独代表当日完成。
 
-1. 按所选活动生成计划，同一游戏与区服合并执行，启动前核对账号和客户端状态。
-2. 每 5 秒读取实际加速状态，只累计经过验证的有效区间；不把睡眠、卡顿或错误游戏产生的时间直接计入。
+1. 按所选活动生成计划，同一平台、游戏与区服合并执行，启动前核对账号和客户端状态。
+2. 每 5 秒读取实际加速状态，只累计经过验证的有效区间；不把睡眠、卡顿或错误游戏、平台、区服产生的时间直接计入。
 3. 达标后等待 20 秒结算缓冲，再读取服务端任务状态，处理符合条件的领取和已有次数的抽奖。
 4. 写请求超时或结果未知时保存待核对状态，不自动重发。用户核对官方结果后重新读取，再决定下一步。
 

@@ -1,6 +1,9 @@
 export type TaskId = string | number;
 export type Timestamp = string | number;
 
+export const PC_PLATFORM_ID = 6;
+export type PlatformId = typeof PC_PLATFORM_ID | 7 | 8 | 9 | 10;
+
 export interface Connection {
   connected: boolean;
   loggedIn: boolean;
@@ -17,6 +20,7 @@ export interface ActivityTask {
   supported?: boolean;
   reason?: string;
   gameName?: string | null;
+  platformId?: number | null;
   seconds?: number | null;
 }
 
@@ -38,6 +42,7 @@ export interface Activity {
 export interface GameMapping {
   gameId: number;
   gameName: string;
+  platformId?: number | null;
   areaId?: number | null;
   areaName?: string;
   seconds?: number;
@@ -53,6 +58,7 @@ export interface SearchGame {
   id: number;
   name: string;
   english: string;
+  platformId?: number | null;
   areas: GameArea[];
 }
 
@@ -71,6 +77,7 @@ export interface PlannedTask {
 export interface TaskGroup {
   id: string;
   gameId: number;
+  platformId?: number | null;
   areaId?: number | null;
   gameName: string;
   tasks: PlannedTask[];
@@ -165,7 +172,7 @@ export type DispatchRequest =
   | { action: 'client-settings'; payload: ClientSettings }
   | { action: 'scan'; payload: { publicOnly?: boolean } }
   | { action: 'import'; payload: { url: string } }
-  | { action: 'search'; payload: { keyword: string } }
+  | { action: 'search'; payload: { keyword: string; platformId?: PlatformId } }
   | { action: 'mapping'; payload: { key: string; gameId: number; areaId: number | null; seconds: number } }
   | { action: 'start'; payload: { ids: string[] } }
   | { action: 'open'; payload: { id: string } }

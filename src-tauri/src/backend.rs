@@ -86,7 +86,8 @@ impl Backend {
             .iter()
             .map(clean_entry)
             .collect::<Result<Vec<_>, _>>()?;
-        let activities = cached_array(&saved, "activities")?.clone();
+        let mut activities = cached_array(&saved, "activities")?.clone();
+        domain::normalize_task_platforms(&mut activities);
         for activity in &activities {
             let id = activity["id"].as_str().ok_or("活动缓存缺少编号")?;
             validate_id(id)?;
@@ -276,9 +277,9 @@ impl Backend {
         Ok(())
     }
 
-    pub async fn search(&mut self, keyword: &str) -> Result<Vec<Value>, String> {
+    pub async fn search(&mut self, keyword: &str, platform: i64) -> Result<Vec<Value>, String> {
         Ok(self
-            .search_raw(keyword)
+            .search_raw(keyword, platform)
             .await?
             .iter()
             .map(ui_game)
@@ -296,10 +297,9 @@ impl Backend {
         let (activity_index, task_index) = self.task_position(key).ok_or("任务不存在，请刷新")?;
         let task = self.activities[activity_index]["tasks"][task_index].clone();
         validate_manual_task(&task, seconds)?;
+        let platform = domain::task_platform(&task)?;
         let game = self.game(game_id).await?;
-        if game["gameInfo"]["platformId"].as_i64() != Some(6) {
-            return Err("请选择 PC 游戏".to_owned());
-        }
+        validate_game_platform(&game, platform)?;
         let area = if let Some(id) = area_id {
             Some(
                 game["areaList"]
@@ -315,8 +315,7 @@ impl Backend {
         } else {
             None
         };
-        let mut mapping =
-            json!({"gameId":game_id,"gameName":game_name(&game),"seconds":seconds,"manual":true});
+        let mut mapping = json!({"gameId":game_id,"gameName":game_name(&game),"seconds":seconds,"manual":true,"platformId":platform});
         if let Some(area) = area {
             mapping["areaId"] = area["areaId"].clone();
             mapping["areaName"] = area["name"].clone();
@@ -364,7 +363,11 @@ impl Backend {
         &mut self,
         game_id: i64,
         area_id: Option<i64>,
+        platform: i64,
     ) -> Result<Value, String> {
+        if !domain::supported_platform(platform) {
+            return Err("任务平台无效".to_owned());
+        }
         if game_id <= 0 || area_id.is_some_and(|id| id <= 0) {
             return Err("游戏或区服编号无效".to_owned());
         }
@@ -375,7 +378,9 @@ impl Backend {
         }
         let current = self.status().await?;
         if current["active"] == true {
-            if current["gameId"].as_i64() == Some(game_id) && self.owned_game_id == Some(game_id) {
+            if domain::acceleration_matches(&current, game_id, platform, area_id)
+                && self.owned_game_id == Some(game_id)
+            {
                 return Ok(current);
             }
             return Err(format!(
@@ -384,13 +389,12 @@ impl Backend {
             ));
         }
         let game = self.game(game_id).await?;
-        if game["gameInfo"]["platformId"].as_i64() != Some(6) {
-            return Err("请选择 PC 游戏".to_owned());
-        }
+        validate_game_platform(&game, platform)?;
         let local = self
             .ipc("get-local-game-config", json!({"gameId":game_id}))
             .await?;
         let payload = start_payload(&game, &local, area_id)?;
+        let selected_area = positive_integer(&payload["gameAreaDto"]["area"]["areaId"]);
         // Avoid claiming a different acceleration started while metadata was loading.
         let current = self.status().await?;
         if current["active"] == true {
@@ -418,7 +422,7 @@ impl Backend {
             for _ in 0..45 {
                 sleep(Duration::from_secs(1)).await;
                 let status = self.status().await?;
-                if status["active"] == true && status["gameId"].as_i64() == Some(game_id) {
+                if domain::acceleration_matches(&status, game_id, platform, selected_area) {
                     return Ok(status);
                 }
                 if status["code"].as_i64().is_some_and(|code| code != 0) {
@@ -584,11 +588,14 @@ impl Backend {
         domain::simplify_activity(entry, info, &config)
     }
 
-    async fn search_raw(&mut self, keyword: &str) -> Result<Vec<Value>, String> {
+    async fn search_raw(&mut self, keyword: &str, platform: i64) -> Result<Vec<Value>, String> {
         if keyword.trim().is_empty() || keyword.encode_utf16().count() > 80 {
             return Err("搜索词无效".to_owned());
         }
-        let result = self.ipc("search-game-list-combine", json!({"keyword":keyword,"searchPlatformIds":[6],"page":{"page":1,"size":30},"isLimitedFree":false})).await?;
+        if !domain::supported_platform(platform) {
+            return Err("游戏搜索平台无效".to_owned());
+        }
+        let result = self.ipc("search-game-list-combine", json!({"keyword":keyword,"searchPlatformIds":[platform],"page":{"page":1,"size":30},"isLimitedFree":false})).await?;
         if result["success"] != true {
             return Err(format!("游戏搜索失败：{keyword}"));
         }
@@ -596,7 +603,7 @@ impl Backend {
         Ok(list
             .iter()
             .filter(|game| {
-                game["gameInfo"]["platformId"].as_i64() == Some(6)
+                game["gameInfo"]["platformId"].as_i64() == Some(platform)
                     && positive_integer(&game["gameInfo"]["gameId"]).is_some()
             })
             .cloned()
@@ -617,7 +624,7 @@ impl Backend {
     }
 
     async fn resolve_games(&mut self) -> Result<(), String> {
-        let mut cache: HashMap<String, Vec<Value>> = HashMap::new();
+        let mut cache: HashMap<(String, i64), Vec<Value>> = HashMap::new();
         let mut mappings = self.mappings.clone();
         for activity in self.activities.clone() {
             for task in activity["tasks"].as_array().into_iter().flatten() {
@@ -626,6 +633,11 @@ impl Backend {
                     domain::value_id(&activity["id"]),
                     domain::value_id(&task["id"])
                 );
+                let platform = match domain::task_platform(task) {
+                    Ok(platform) => platform,
+                    Err(_) => continue,
+                };
+                discard_mismatched_mapping(&mut mappings, &key, platform);
                 if task["supported"] != true || mappings[&key]["manual"] == true {
                     continue;
                 }
@@ -639,14 +651,15 @@ impl Backend {
                 if query.is_empty() {
                     continue;
                 }
-                if !cache.contains_key(&query) {
-                    // Search failure or ambiguity keeps the task visible for manual mapping.
+                let cache_key = (query.clone(), platform);
+                if !cache.contains_key(&cache_key) {
+                    // 同名主机条目不能复用 PC 或另一主机平台的搜索结果。
                     cache.insert(
-                        query.clone(),
-                        self.search_raw(&query).await.unwrap_or_default(),
+                        cache_key.clone(),
+                        self.search_raw(&query, platform).await.unwrap_or_default(),
                     );
                 }
-                let Some(game) = domain::choose_game(&query, &cache[&query]) else {
+                let Some(game) = domain::choose_game(&query, &cache[&cache_key]) else {
                     continue;
                 };
                 let traditional = text(&task["title"]).contains("繁中");
@@ -660,7 +673,7 @@ impl Backend {
                 if traditional && area.is_none() {
                     continue;
                 }
-                let mut mapping = json!({"gameId":game["gameInfo"]["gameId"],"gameName":game_name(&game),"manual":false});
+                let mut mapping = json!({"gameId":game["gameInfo"]["gameId"],"gameName":game_name(&game),"manual":false,"platformId":platform});
                 if let Some(area) = area {
                     mapping["areaId"] = area["areaId"].clone();
                     mapping["areaName"] = area["name"].clone();
@@ -1339,8 +1352,32 @@ fn game_name(game: &Value) -> &str {
         alias
     }
 }
+fn discard_mismatched_mapping(mappings: &mut Value, key: &str, platform: i64) {
+    let saved_platform = mappings[key]
+        .get("platformId")
+        .filter(|value| !value.is_null())
+        .map_or(Some(domain::PC_PLATFORM), Value::as_i64);
+    if saved_platform != Some(platform) {
+        if let Some(mappings) = mappings.as_object_mut() {
+            mappings.remove(key);
+        }
+    }
+}
+
+fn validate_game_platform(game: &Value, platform: i64) -> Result<(), String> {
+    if !domain::supported_platform(platform)
+        || game["gameInfo"]["platformId"].as_i64() != Some(platform)
+    {
+        return Err(format!(
+            "游戏平台与任务要求不符，请选择 {} 游戏",
+            domain::platform_name(platform)
+        ));
+    }
+    Ok(())
+}
+
 fn ui_game(game: &Value) -> Value {
-    json!({"id":game["gameInfo"]["gameId"],"name":game_name(game),"english":game["gameInfo"]["gameName"],"areas":game["areaList"].as_array().cloned().unwrap_or_default()})
+    json!({"id":game["gameInfo"]["gameId"],"name":game_name(game),"english":game["gameInfo"]["gameName"],"platformId":game["gameInfo"]["platformId"],"areas":game["areaList"].as_array().cloned().unwrap_or_default()})
 }
 fn normalize_status(raw: &Value) -> Result<Value, String> {
     let code = raw["code"].as_i64();
@@ -1355,7 +1392,7 @@ fn normalize_status(raw: &Value) -> Result<Value, String> {
     let game_id = positive_integer(&raw["gameId"]);
     Ok(
         json!({"active":code == Some(0) && game_id.is_some(),"gameId":game_id,
-        "gameName":game_name(&raw["gameData"]),"areaId":positive_integer(&raw["area"]["areaId"]),
+        "gameName":game_name(&raw["gameData"]),"platformId":positive_integer(&raw["gameData"]["gameInfo"]["platformId"]),"areaId":positive_integer(&raw["area"]["areaId"]),
         "code":code,"message":text(&raw["msg"]),"allowed":raw["checkSpeedUpInfo"]["canSpeedup"],"blockType":raw["checkSpeedUpInfo"]["blockType"]}),
     )
 }
@@ -1363,14 +1400,15 @@ fn validate_manual_task(task: &Value, seconds: f64) -> Result<(), String> {
     // Use domain rules for mobile exclusion even on a manually overridden task.
     let activity = json!({"id":"check","tasks":[task]});
     let key = format!("check:{}", domain::value_id(&task["id"]));
-    let mappings = json!({key:{"gameId":1,"seconds":seconds,"manual":true}});
+    let platform = domain::task_platform(task)?;
+    let mappings = json!({key:{"gameId":1,"seconds":seconds,"manual":true,"platformId":platform}});
     let plan = domain::build_plan(&[activity], &mappings, None, domain::now_ms());
     if task["type"].as_i64() != Some(7)
         || plan["groups"]
             .as_array()
             .is_none_or(|groups| groups.is_empty())
     {
-        return Err("这不是可设置的 PC 加速任务".to_owned());
+        return Err("这不是可设置的客户端加速任务".to_owned());
     }
     Ok(())
 }
@@ -1644,6 +1682,197 @@ mod tests {
         assert_eq!(payload["useGiftVip"], false);
         assert!(start_payload(&game, &json!({}), Some(99)).is_err());
         assert_eq!(ui_game(&game)["english"], "English");
+    }
+
+    #[test]
+    fn console_payloads_preserve_platform_and_catalog_acceleration_mode() {
+        for platform in [7, 8, 9, 10] {
+            let game = json!({"gameInfo":{"gameId":42,"platformId":platform,"aliasName":"主机游戏"},
+                "areaList":[{"areaId":1251,"name":"全球服"}],"speedupModelList":[{"speedupModelId":4}]});
+            validate_game_platform(&game, platform).unwrap();
+            assert!(validate_game_platform(&game, 6).is_err());
+            let payload = start_payload(&game, &json!({"accMode":3}), None).unwrap();
+            assert_eq!(payload["gameData"]["gameInfo"]["platformId"], platform);
+            assert_eq!(payload["gameAreaDto"]["accMode"]["speedupModelId"], 4);
+            assert_eq!(ui_game(&game)["platformId"], platform);
+            assert_eq!(
+                normalize_status(&json!({"code":0,"gameId":42,"gameData":game})).unwrap()
+                    ["platformId"],
+                platform
+            );
+        }
+    }
+
+    #[test]
+    fn stale_console_mappings_are_removed_without_discarding_pc_or_valid_manual_choices() {
+        let mut mappings = json!({
+            "legacy":{"gameId":11001121,"manual":true},
+            "wrong":{"gameId":11001121,"platformId":6},
+            "valid":{"gameId":42,"platformId":8,"manual":true},
+            "pc":{"gameId":1,"manual":true}
+        });
+        for key in ["legacy", "wrong", "valid"] {
+            discard_mismatched_mapping(&mut mappings, key, 8);
+        }
+        discard_mismatched_mapping(&mut mappings, "pc", 6);
+        assert!(mappings.get("legacy").is_none());
+        assert!(mappings.get("wrong").is_none());
+        assert_eq!(mappings["valid"]["gameId"], 42);
+        assert_eq!(mappings["pc"]["gameId"], 1);
+        assert!(validate_manual_task(
+            &json!({"id":1,"type":7,"title":"加速《GTA6》PS端10min"}),
+            600.0
+        )
+        .is_ok());
+        assert!(validate_manual_task(
+            &json!({"id":2,"type":7,"title":"加速《GTA6》Xbox端10min"}),
+            600.0
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn console_start_sends_catalog_platform_and_verifies_the_actual_acceleration() {
+        for platform in [8, 9] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let game = json!({"gameInfo":{"gameId":42,"platformId":platform,"aliasName":"GTA6"},
+                    "areaList":[{"areaId":7,"name":"全球服"}],"speedupModelList":[{"speedupModelId":4}]});
+                let commands = [
+                    "get-accelerate-data",
+                    "get-games-by-ids",
+                    "get-local-game-config",
+                    "get-accelerate-data",
+                    "start-accelerate",
+                    "get-accelerate-data",
+                ];
+                for (step, command) in commands.iter().enumerate() {
+                    let request: Value = serde_json::from_str(
+                        &ws.next().await.unwrap().unwrap().into_text().unwrap(),
+                    )
+                    .unwrap();
+                    let expression = text(&request["params"]["expression"]);
+                    let call: Value = serde_json::from_str(
+                        expression
+                            .strip_prefix("window.ipc.send(")
+                            .unwrap()
+                            .strip_suffix(')')
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(call["command"], *command);
+                    let value = match step {
+                        1 => json!([game]),
+                        2 => json!({"area":7,"accMode":3}),
+                        4 => {
+                            assert_eq!(
+                                call["data"]["gameData"]["gameInfo"]["platformId"],
+                                platform
+                            );
+                            assert_eq!(call["data"]["gameAreaDto"]["area"]["areaId"], 7);
+                            assert_eq!(call["data"]["gameAreaDto"]["accMode"]["speedupModelId"], 4);
+                            json!(true)
+                        }
+                        5 => json!({"code":0,"gameId":42,"gameData":game,"area":{"areaId":7}}),
+                        _ => json!({"bytes":0,"msg":""}),
+                    };
+                    ws.send(Message::Text(json!({"id":request["id"],"result":{"result":{"type":"object","value":value}}}).to_string().into())).await.unwrap();
+                }
+            });
+            let root = tempfile::tempdir().unwrap();
+            let storage = Storage::new(root.path().to_owned()).unwrap();
+            let mut backend = Backend::new(storage, port, root.path().join("unused.exe"))
+                .await
+                .unwrap();
+            backend.cdp = Some(
+                Cdp::connect(
+                    &format!("ws://127.0.0.1:{port}/devtools/page/fixture"),
+                    port,
+                )
+                .await
+                .unwrap(),
+            );
+            let status = backend.start_game(42, Some(7), platform).await.unwrap();
+            assert!(domain::acceleration_matches(&status, 42, platform, Some(7)));
+            assert_eq!(backend.owned_game_id, Some(42));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn console_resolution_searches_each_platform_and_replaces_legacy_pc_ids() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            for platform in [8, 9] {
+                let request: Value =
+                    serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap())
+                        .unwrap();
+                let expression = text(&request["params"]["expression"]);
+                let call: Value = serde_json::from_str(
+                    expression
+                        .strip_prefix("window.ipc.send(")
+                        .unwrap()
+                        .strip_suffix(')')
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(call["command"], "search-game-list-combine");
+                assert_eq!(call["data"]["searchPlatformIds"], json!([platform]));
+                let games = [6, 8, 9].map(
+                    |id| json!({"gameInfo":{"gameId":id * 100,"platformId":id,"aliasName":"GTA6"}}),
+                );
+                ws.send(Message::Text(json!({"id":request["id"],"result":{"result":{"type":"object","value":{"success":true,"list":games}}}}).to_string().into())).await.unwrap();
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let storage = Storage::new(root.path().to_owned()).unwrap();
+        storage.write("activities.json", &json!({"entries":[],"activities":[{"id":"gta","tasks":[
+            {"id":1,"type":7,"supported":true,"status":1,"seconds":600,"gameName":"GTA6","title":"加速《GTA6》PS端10min"},
+            {"id":2,"type":7,"supported":true,"status":1,"seconds":600,"gameName":"GTA6","title":"加速《GTA6》Xbox端10min"}
+        ]}]})).await.unwrap();
+        storage
+            .write(
+                "mappings.json",
+                &json!({"gta:1":{"gameId":11001121,"manual":true},"gta:2":{"gameId":11001121}}),
+            )
+            .await
+            .unwrap();
+        let mut backend = Backend::new(storage.clone(), port, root.path().join("unused.exe"))
+            .await
+            .unwrap();
+        assert_eq!(backend.activities[0]["tasks"][0]["platformId"], 8);
+        backend.cdp = Some(
+            Cdp::connect(
+                &format!("ws://127.0.0.1:{port}/devtools/page/fixture"),
+                port,
+            )
+            .await
+            .unwrap(),
+        );
+        backend.resolve_games().await.unwrap();
+        assert_eq!(backend.mappings["gta:1"]["gameId"], 800);
+        assert_eq!(backend.mappings["gta:1"]["platformId"], 8);
+        assert_eq!(backend.mappings["gta:2"]["gameId"], 900);
+        assert_eq!(backend.mappings["gta:2"]["platformId"], 9);
+        assert_eq!(
+            storage.read("mappings.json", Value::Null).await.unwrap(),
+            backend.mappings
+        );
+        let plan = domain::build_plan(
+            &backend.activities,
+            &backend.mappings,
+            None,
+            domain::now_ms(),
+        );
+        assert_eq!(plan["groups"].as_array().unwrap().len(), 2);
+        assert_eq!(plan["totalSeconds"], 1200);
+        server.await.unwrap();
     }
 
     #[test]

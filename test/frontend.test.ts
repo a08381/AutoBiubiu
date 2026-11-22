@@ -10,8 +10,11 @@ import {
   formatMembershipTime,
   isoTime,
   mappingDescription,
+  matchesPlatform,
+  platformLabel,
   prettyJson,
   taskKey,
+  taskPlatformId,
   taskStatus,
   validateActivityUrl,
 } from '../src/lib/format';
@@ -146,18 +149,53 @@ describe('前端格式化与输入校验', () => {
     }
   });
 
-  it('区分可配置的 PC 加速任务与移动端任务', () => {
+  it('区分可配置的加速任务与移动端任务', () => {
     expect(canConfigure(task())).toBe(true);
+    expect(canConfigure(task({ title: '加速《GTA6》PS5 版', platformId: 8 }))).toBe(true);
     expect(canConfigure(task({ type: 11 }))).toBe(false);
     expect(canConfigure(task({ title: '加速游戏 iOS端 10分钟' }))).toBe(false);
     expect(canConfigure(task({ description: '移动端任务' }))).toBe(false);
   });
 
-  it('优先显示已保存映射，并正确描述缺失映射原因', () => {
+  it('使用官方平台编号；有主机提示的旧任务不默认成 PC', () => {
+    expect(taskPlatformId(task())).toBe(6);
+    expect(taskPlatformId(task({ title: '加速《FPS 游戏》' }))).toBe(6);
+    for (const [platformId, label] of [[6, 'PC'], [7, 'Switch'], [8, 'PlayStation'], [9, 'Xbox'], [10, 'Steam Deck']] as const) {
+      expect(taskPlatformId(task({ platformId }))).toBe(platformId);
+      expect(platformLabel(platformId)).toBe(label);
+    }
+    for (const hint of ['ＰＳ５版', 'Xbox Series X', 'Switch 版', 'SteamDeck 版', '主机端']) {
+      const cachedTask = task({ description: hint });
+      expect(taskPlatformId(cachedTask)).toBeUndefined();
+      expect(mappingDescription(cachedTask)).toContain('平台待确认');
+    }
+    expect(taskPlatformId(task({ platformId: 99 }))).toBeUndefined();
+  });
+
+  it('同名游戏只匹配任务平台，无平台的旧 PC 结果不用于主机', () => {
+    const games = [
+      { id: 1, name: 'GTA6', platformId: 6 }, { id: 2, name: 'GTA6', platformId: 8 },
+      { id: 3, name: 'GTA6', platformId: 9 }, { id: 4, name: 'GTA6', platformId: undefined },
+    ];
+    const matches = (platformId?: 6 | 8 | 9) => games.filter((game) => matchesPlatform(game.platformId, platformId));
+    expect(matches(6).map((game) => game.id)).toEqual([1, 4]);
+    expect(matches(8).map((game) => game.id)).toEqual([2]);
+    expect(matches(9).map((game) => game.id)).toEqual([3]);
+    expect(matches()).toEqual([]);
+  });
+
+  it('显示同平台映射，提醒重新匹配主机的旧 PC 或异平台映射', () => {
     const mapped: GameMapping = { gameId: 7, gameName: '测试游戏', areaName: '一区', seconds: 900 };
-    expect(mappingDescription(task(), mapped)).toBe('测试游戏 · 一区 · 15 分钟');
-    expect(mappingDescription(task({ reason: '活动规则不支持' }))).toBe('活动规则不支持');
-    expect(mappingDescription(task({ supported: false }))).toBe('待匹配游戏，请选择游戏、区服和时长');
+    const psTask = task({ platformId: 8 });
+    expect(mappingDescription(task(), mapped)).toBe('PC · 测试游戏 · 一区 · 15 分钟');
+    expect(mappingDescription(psTask, { ...mapped, platformId: 8 })).toBe('PlayStation · 测试游戏 · 一区 · 15 分钟');
+    for (const stale of [mapped, { ...mapped, platformId: 6 }, { ...mapped, platformId: 9 }]) {
+      const description = mappingDescription(psTask, stale);
+      expect(description).toContain('PlayStation · 旧映射需重新匹配');
+      expect(description).not.toContain(mapped.gameName);
+    }
+    expect(mappingDescription(task({ reason: '活动规则不支持' }))).toBe('PC · 活动规则不支持');
+    expect(mappingDescription(task({ supported: false }))).toBe('PC · 待匹配游戏，请选择游戏、区服和时长');
     expect(mappingDescription(task({ type: 11, description: '请分享活动' }))).toBe('请分享活动');
   });
 
@@ -188,12 +226,25 @@ describe('桌面 IPC 契约', () => {
   });
 
   it('状态读取只调用 get_state，搜索保留 action 与 payload 结构', async () => {
-    const snapshot = { version: '0.3.0', run: { status: 'idle' } };
+    const snapshot = { version: '0.3.1', run: { status: 'idle' } };
     desktop.invoke.mockResolvedValueOnce(snapshot).mockResolvedValueOnce([]);
     expect(await getState()).toEqual(snapshot);
     expect(desktop.invoke).toHaveBeenNthCalledWith(1, 'get_state', undefined);
     expect(await dispatch({ action: 'search', payload: { keyword: '测试游戏' } })).toEqual([]);
     expect(desktop.invoke).toHaveBeenNthCalledWith(2, 'dispatch', { action: 'search', payload: { keyword: '测试游戏' } });
+  });
+
+  it('PS 与 Xbox 搜索转发平台，保存映射仍只发送选定游戏、区服与时长', async () => {
+    desktop.invoke.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce(undefined);
+    await dispatch({ action: 'search', payload: { keyword: 'GTA6', platformId: 8 } });
+    await dispatch({ action: 'search', payload: { keyword: 'GTA6', platformId: 9 } });
+    const payload = { key: 'activity-1:001', gameId: 20, areaId: null, seconds: 600 };
+    await dispatch({ action: 'mapping', payload });
+    expect(desktop.invoke.mock.calls).toEqual([
+      ['dispatch', { action: 'search', payload: { keyword: 'GTA6', platformId: 8 } }],
+      ['dispatch', { action: 'search', payload: { keyword: 'GTA6', platformId: 9 } }],
+      ['dispatch', { action: 'mapping', payload }],
+    ]);
   });
 
   it('安装识别和目录选择只读，保存配置沿用串行操作通道', async () => {
