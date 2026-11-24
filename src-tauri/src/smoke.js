@@ -1,7 +1,8 @@
 (() => {
   const report = { rendered: false, ipc: false, importValidation: false, operationsBlocked: false,
     navigation: false, themeSwitch: false, activityFilter: false, activitySelection: false,
-    activityDetails: false, windowControls: false, desktopLayout: false, membershipDisplay: false, clientSettings: false };
+    activityDetails: false, windowControls: false, desktopLayout: false, membershipDisplay: false, clientSettings: false,
+    updateBanner: false };
   const internals = window.__TAURI_INTERNALS__;
   const send = (extra = {}) => internals?.invoke('smoke_report', { report: { ...report, ...extra } }).catch((error) => console.error('smoke_report failed', error));
   const waitFor = async (check, timeout = 10000) => {
@@ -33,6 +34,12 @@
     } catch (error) {
       return send({ error: `读取状态失败：${error?.message || error}` });
     }
+
+    const banner = await waitFor(() => document.querySelector('.update-banner'));
+    const release = await internals.invoke('check_update');
+    const bannerControls = !!banner && banner.textContent.includes(`v${release.latestVersion}`)
+      && banner.textContent.includes(`v${release.currentVersion}`)
+      && [...banner.querySelectorAll('button')].some((button) => button.textContent.includes('查看更新'));
 
     report.membershipDisplay = !!(await waitFor(() => {
       const panel = document.querySelector('.membership-info');
@@ -147,11 +154,28 @@
         const bounds = document.querySelector(selector)?.getBoundingClientRect();
         return bounds && bounds.width > 0 && bounds.height > 0 && bounds.right <= innerWidth + 1 && bounds.bottom <= innerHeight + 1;
       }) && document.querySelector('.start-button')?.disabled === !state.connection.connected;
+    const bannerBounds = banner?.getBoundingClientRect();
+    const headerBounds = document.querySelector('.page-header')?.getBoundingClientRect();
+    const commandsBounds = document.querySelector('.command-bar')?.getBoundingClientRect();
+    const stopBounds = document.querySelector('.stop-button')?.getBoundingClientRect();
+    const executionBounds = document.querySelector('.execution-pane')?.getBoundingClientRect();
+    const bannerLayout = bannerBounds && headerBounds && commandsBounds && stopBounds && executionBounds
+      && bannerBounds.width > 0 && bannerBounds.height > 0 && bannerBounds.right <= innerWidth + 1
+      && banner.scrollWidth <= banner.clientWidth + 1
+      && bannerBounds.top >= headerBounds.bottom - 1 && commandsBounds.top >= bannerBounds.bottom - 1
+      && stopBounds.bottom <= executionBounds.bottom + 1;
+    // 第一轮保留横幅供真实窗口截图；最小尺寸的第二轮验证关闭交互。
+    let dismissed = true;
+    if (innerWidth <= 900) {
+      // 验证真实按钮 IPC 和错误呈现，隔离后台阻止打开系统浏览器。
+      [...banner.querySelectorAll('button')].find((button) => button.textContent.includes('查看更新')).click();
+      const openHandled = await waitFor(() => banner.querySelector('[role="alert"]')?.textContent.includes('冒烟测试模式不打开系统浏览器'));
+      click('[aria-label="暂时关闭更新提示"]');
+      dismissed = !!openHandled && !!(await waitFor(() => !document.querySelector('.update-banner')));
+    }
+    report.updateBanner = !!bannerControls && !!bannerLayout && !!dismissed;
     const failed = Object.entries(report).filter(([, passed]) => !passed).map(([key]) => key);
     if (failed.length) return send({ error: `界面检查未通过：${failed.join('、')}` });
-    // 本轮截图展示新增设置区域；仅保存隔离配置，不启动客户端。
-    click('.nav-rail button[title="设置"]');
-    await waitFor(() => document.querySelector('.client-settings-panel'));
     send();
   };
   run().catch((error) => send({ error: `界面冒烟异常：${error?.message || error}` }));

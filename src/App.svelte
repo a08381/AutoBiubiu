@@ -5,15 +5,16 @@
   import TitleBar from './lib/TitleBar.svelte';
   import MembershipInfo from './lib/MembershipInfo.svelte';
   import ClientSettingsPanel from './lib/ClientSettingsPanel.svelte';
+  import UpdateBanner from './lib/UpdateBanner.svelte';
   import RecordList from './lib/RecordList.svelte';
   import { filterActivities, focusedActivity } from './lib/workspace';
-  import { dispatch, getState, openDataDir, openExternal, requestExit } from './lib/ipc';
+  import { checkUpdate, dispatch, getState, openDataDir, openExternal, openLatestRelease, requestExit } from './lib/ipc';
   import {
     canConfigure, duration, errorMessage, formatTime, matchesPlatform, MAPPING_PLATFORM_REFRESH, platformLabel,
     taskKey, taskPlatformId, TASK_PLATFORM_REFRESH, validateActivityUrl,
   } from './lib/format';
   import { PC_PLATFORM_ID, type Activity, type ActivityTask, type DispatchRequest, type MutationRequest,
-    type RunStatus, type SearchGame, type Snapshot } from './lib/types';
+    type ReleaseUpdate, type RunStatus, type SearchGame, type Snapshot } from './lib/types';
 
   type DialogName = 'mapping' | 'import' | 'reconcile';
   type UtilityAction = 'external' | 'directory' | 'exit';
@@ -25,6 +26,8 @@
   };
 
   let snapshot = $state<Snapshot | null>(null);
+  let latestUpdate = $state<ReleaseUpdate | null>(null);
+  let dismissedVersion = $state('');
   let selectedIds = $state<string[]>([]);
   let mainError = $state('');
   let stateError = $state('');
@@ -176,6 +179,13 @@
     try { window.localStorage.setItem('autobiubiu-theme', value); } catch { /* 存储不可用时仅应用到当前窗口。 */ }
   }
 
+  async function refreshUpdate(): Promise<void> {
+    try {
+      const update = await checkUpdate();
+      if (mounted) latestUpdate = update;
+    } catch { /* 离线或 GitHub 限流时不打断活动任务。 */ }
+  }
+
   $effect(() => { document.documentElement.dataset.theme = dark ? 'dark' : 'light'; });
 
   onMount(() => {
@@ -189,6 +199,7 @@
     const onThemeChange = (event: MediaQueryListEvent) => { systemDark = event.matches; };
     media.addEventListener('change', onThemeChange);
     void refreshState();
+    void refreshUpdate();
     const timer = window.setInterval(() => { void refreshState(); }, 2000);
     return () => {
       mounted = false;
@@ -410,7 +421,7 @@
       <div class="rail-spacer"></div>
       <button type="button" class:current={page === 'settings'} aria-current={page === 'settings' ? 'page' : undefined}
         title="设置" onclick={() => { page = 'settings'; }}><Icon name="settings" size={22} /><span>设置</span></button>
-      <span class="rail-version">v{snapshot?.version || '0.3.2'}</span>
+      <span class="rail-version">v{snapshot?.version || '0.3.3'}</span>
     </nav>
 
     <main class="workspace">
@@ -427,6 +438,11 @@
             onrefresh={() => { void mutate({ action: 'membership', payload: {} }); }} />
         </div>
       </header>
+
+      {#if latestUpdate && latestUpdate.latestVersion !== dismissedVersion}
+        <UpdateBanner update={latestUpdate} onopen={openLatestRelease}
+          onclose={() => { dismissedVersion = latestUpdate?.latestVersion ?? ''; }} />
+      {/if}
 
       {#if stateError || mainError || backgroundError || run?.pending}
         <div class="notifications">
@@ -558,9 +574,9 @@
           <h2 class="settings-section-title">应用与数据</h2>
           <div class="setting-row"><span class="setting-icon"><Icon name="folder" size={21} /></span><div class="setting-copy"><h3>本机记录目录</h3><p class="data-directory">{snapshot?.dataDir || '正在读取目录…'}</p></div><button type="button" class="secondary" disabled={utilityBusy !== null} onclick={() => utility('directory')}>打开目录</button></div>
           <div class="setting-row"><span class="setting-icon"><Icon name="monitor" size={21} /></span><div class="setting-copy"><h3>关闭窗口时收起到托盘</h3><p>任务保持运行；需要完全退出时，使用下方的“退出应用”。</p></div><span class="setting-value">已启用</span></div>
-          <div class="setting-row"><span class="setting-icon"><Icon name="clock" size={21} /></span><div class="setting-copy"><h3>计时与任务规则</h3><p>同平台、同游戏、同区服合并计时，以活动服务器的完成状态为准。Warframe 移动版奖励共用 PC 加速；其他手机端、邀请和游戏内任务需手动完成。</p></div></div>
+          <div class="setting-row"><span class="setting-icon"><Icon name="clock" size={21} /></span><div class="setting-copy"><h3>计时与任务规则</h3><p>同平台、同游戏、同区服合并计时。手机端、邀请和游戏内任务需手动完成。</p></div></div>
           <div class="setting-row"><span class="setting-icon"><Icon name="power" size={21} /></span><div class="setting-copy"><h3>退出应用</h3><p>由桌面后台确认退出、停止加速并保存记录。</p></div><button type="button" class="secondary" disabled={utilityBusy !== null} onclick={() => utility('exit')}>{utilityBusy === 'exit' ? '正在退出…' : '退出应用'}</button></div>
-          <div class="about-app"><span class="app-symbol"><Icon name="arrow" size={20} /></span><strong>AutoBiubiu</strong><span>版本 {snapshot?.version || '0.3.2'} · 本地活动助手</span><p>让等待有个好结果。</p></div>
+          <div class="about-app"><span class="app-symbol"><Icon name="arrow" size={20} /></span><strong>AutoBiubiu</strong><span>版本 {snapshot?.version || '0.3.3'} · 本地活动助手</span><p>让等待有个好结果。</p></div>
         </section>
       {/if}
     </main>

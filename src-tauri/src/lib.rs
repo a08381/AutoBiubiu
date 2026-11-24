@@ -7,6 +7,7 @@ mod lease;
 mod membership;
 mod smoke;
 mod storage;
+mod updates;
 
 use engine::Engine;
 use serde_json::Value;
@@ -27,6 +28,7 @@ use tauri_plugin_opener::OpenerExt;
 
 struct Desktop {
     engine: Arc<Engine>,
+    updates: updates::UpdateChecker,
     exit_requested: AtomicBool,
     exit_allowed: AtomicBool,
     smoke: smoke::Smoke,
@@ -35,6 +37,27 @@ struct Desktop {
 #[tauri::command]
 async fn get_state(state: State<'_, Desktop>) -> Result<Value, String> {
     Ok(state.smoke.decorate_snapshot(state.engine.snapshot().await))
+}
+
+#[tauri::command]
+async fn check_update(state: State<'_, Desktop>) -> Result<Option<updates::ReleaseUpdate>, String> {
+    if state.smoke.enabled() {
+        return Ok(Some(updates::ReleaseUpdate {
+            current_version: env!("CARGO_PKG_VERSION").to_owned(),
+            latest_version: "9999.0.0".to_owned(),
+        }));
+    }
+    state.updates.check().await
+}
+
+#[tauri::command]
+fn open_latest_release(app: tauri::AppHandle, state: State<'_, Desktop>) -> Result<(), String> {
+    if state.smoke.enabled() {
+        return Err("冒烟测试模式不打开系统浏览器".to_owned());
+    }
+    app.opener()
+        .open_url(updates::LATEST_URL, None::<&str>)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -295,9 +318,7 @@ fn legacy_directory() -> Option<PathBuf> {
 /// 0.3.x 曾把记录放在 %APPDATA%\AutoBiubiu\data；老版本升级时自动搬回运行目录。
 fn appdata_legacy_directory() -> Option<PathBuf> {
     let appdata = std::env::var_os("APPDATA")?;
-    let dir = PathBuf::from(appdata)
-        .join("AutoBiubiu")
-        .join("data");
+    let dir = PathBuf::from(appdata).join("AutoBiubiu").join("data");
     dir.is_dir().then_some(dir)
 }
 
@@ -341,6 +362,7 @@ fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     .map_err(std::io::Error::other)?;
     app.manage(Desktop {
         engine,
+        updates: updates::UpdateChecker::new().map_err(std::io::Error::other)?,
         exit_requested: AtomicBool::new(false),
         exit_allowed: AtomicBool::new(false),
         smoke,
@@ -403,6 +425,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
+            check_update,
+            open_latest_release,
             dispatch,
             open_external,
             open_data_dir,

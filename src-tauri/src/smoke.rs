@@ -172,6 +172,7 @@ async fn inspect(app: &tauri::AppHandle, state: &Desktop, report: &Value) -> Res
         "desktopLayout",
         "membershipDisplay",
         "clientSettings",
+        "updateBanner",
     ];
     if ui_checks.iter().any(|key| report[*key] != true) {
         return Err("冒烟报告缺少界面检查结果".into());

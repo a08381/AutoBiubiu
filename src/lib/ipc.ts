@@ -1,5 +1,5 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
-import type { ClientInstallation, DispatchRequest, MutationRequest, SearchGame, SearchRequest, Snapshot } from './types';
+import type { ClientInstallation, DispatchRequest, MutationRequest, ReleaseUpdate, SearchGame, SearchRequest, Snapshot } from './types';
 
 async function invokeDesktop<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (!isTauri()) throw new Error('当前窗口未接入桌面后台，请通过 Tauri 桌面应用启动。');
@@ -19,6 +19,14 @@ export function dispatch(request: DispatchRequest): Promise<unknown> {
 
 export function openExternal(url: string): Promise<void> {
   return invokeDesktop<void>('open_external', { url });
+}
+
+export function checkUpdate(): Promise<ReleaseUpdate | null> {
+  return invokeDesktop<ReleaseUpdate | null>('check_update');
+}
+
+export function openLatestRelease(): Promise<void> {
+  return invokeDesktop<void>('open_latest_release');
 }
 
 export function openDataDir(): Promise<void> {

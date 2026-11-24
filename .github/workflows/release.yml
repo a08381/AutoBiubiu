@@ -1,0 +1,67 @@
+name: Release portable
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 不取消正在上传的版本，避免发布过程被后续 push 中断。
+concurrency:
+  group: portable-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout the exact pushed commit and all release tags
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Check whether this version needs a release
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/release.mjs check --state "$env:RUNNER_TEMP/release-state.json"
+
+      - name: Install Rust
+        if: steps.version.outputs.should_release == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install locked frontend dependencies
+        if: steps.version.outputs.should_release == 'true'
+        run: npm ci
+
+      - name: Run frontend, Rust, packaging and release tests
+        if: steps.version.outputs.should_release == 'true'
+        run: npm test
+
+      - name: Build and verify the portable ZIP
+        if: steps.version.outputs.should_release == 'true'
+        run: npm run dist
+
+      - name: Generate release notes from every commit since the previous release
+        if: steps.version.outputs.should_release == 'true'
+        run: node scripts/release.mjs notes --state "$env:RUNNER_TEMP/release-state.json" --output "$env:RUNNER_TEMP/release-notes.md"
+
+      - name: Upload the portable ZIP and publish the release
+        if: steps.version.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/release.mjs publish --state "$env:RUNNER_TEMP/release-state.json" --notes "$env:RUNNER_TEMP/release-notes.md"

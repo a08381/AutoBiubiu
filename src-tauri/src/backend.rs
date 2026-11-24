@@ -86,7 +86,8 @@ impl Backend {
             .iter()
             .map(clean_entry)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut activities = cached_array(&saved, "activities")?.clone();
+        let saved_activities = cached_array(&saved, "activities")?;
+        let mut activities = saved_activities.clone();
         domain::normalize_task_platforms(&mut activities);
         for activity in &activities {
             let id = activity["id"].as_str().ok_or("活动缓存缺少编号")?;
@@ -95,13 +96,23 @@ impl Backend {
                 return Err("活动缓存的任务列表格式无效".to_owned());
             }
         }
-        let mappings = storage.read("mappings.json", json!({})).await?;
-        if !mappings.is_object() {
+        let saved_mappings = storage.read("mappings.json", json!({})).await?;
+        if !saved_mappings.is_object() {
             return Err("游戏映射缓存格式无效".to_owned());
         }
+        let mut mappings = saved_mappings.clone();
+        discard_mobile_mappings(&mut mappings, &activities);
         let run = storage.read("run.json", json!({})).await?;
         let local_http = http_client(Duration::from_secs(3))?;
         let public_http = http_client(HTTP_TIMEOUT)?;
+        if mappings != saved_mappings {
+            storage.write("mappings.json", &mappings).await?;
+        }
+        if activities != *saved_activities {
+            let mut normalized = saved.clone();
+            normalized["activities"] = json!(activities);
+            storage.write("activities.json", &normalized).await?;
+        }
         Ok(Self {
             activities,
             mappings,
@@ -270,7 +281,8 @@ impl Backend {
         let mut activities = self.activities.clone();
         entries.push(entry);
         activities.push(activity);
-        self.save_catalog(&entries, &activities, &self.updated_at)
+        let updated_at = self.updated_at.clone();
+        self.save_catalog(&entries, &activities, &updated_at)
             .await?;
         self.entries = entries;
         self.activities = activities;
@@ -327,7 +339,9 @@ impl Backend {
         activities[activity_index]["tasks"][task_index]["reason"] = json!("");
         self.storage.write("mappings.json", &mappings).await?;
         self.mappings = mappings;
-        self.save_catalog(&self.entries, &activities, &self.updated_at)
+        let entries = self.entries.clone();
+        let updated_at = self.updated_at.clone();
+        self.save_catalog(&entries, &activities, &updated_at)
             .await?;
         self.activities = activities;
         Ok(())
@@ -348,7 +362,9 @@ impl Backend {
         } else {
             activities.push(activity.clone());
         }
-        self.save_catalog(&self.entries, &activities, &self.updated_at)
+        let entries = self.entries.clone();
+        let updated_at = self.updated_at.clone();
+        self.save_catalog(&entries, &activities, &updated_at)
             .await?;
         self.activities = activities;
         Ok(activity)
@@ -492,6 +508,16 @@ impl Backend {
         if !(task_id.is_number() || task_id.as_str().is_some_and(|s| !s.is_empty())) {
             return Err(ApiError::known("任务编号无效"));
         }
+        let task = self
+            .activities
+            .iter()
+            .find(|activity| activity["id"] == id)
+            .and_then(|activity| activity["tasks"].as_array())
+            .and_then(|tasks| tasks.iter().find(|task| task["id"] == *task_id))
+            .ok_or_else(|| ApiError::known("任务不存在，请刷新活动"))?;
+        if let Some(reason) = domain::mobile_task_reason(task) {
+            return Err(ApiError::known(reason));
+        }
         self.request(
             "/reportTaskFinish",
             json!({"activityUuid":id,"taskId":task_id}),
@@ -542,11 +568,19 @@ impl Backend {
     }
 
     async fn save_catalog(
-        &self,
+        &mut self,
         entries: &[Value],
         activities: &[Value],
         updated_at: &Value,
     ) -> Result<(), String> {
+        let mut mappings = self.mappings.clone();
+        // 新详情可能移除旧任务；先依据已有缓存清理，再依据刷新后的任务要求清理。
+        discard_mobile_mappings(&mut mappings, &self.activities);
+        discard_mobile_mappings(&mut mappings, activities);
+        if mappings != self.mappings {
+            self.storage.write("mappings.json", &mappings).await?;
+            self.mappings = mappings;
+        }
         self.storage
             .write(
                 "activities.json",
@@ -626,8 +660,12 @@ impl Backend {
     async fn resolve_games(&mut self) -> Result<(), String> {
         let mut cache: HashMap<(String, i64), Vec<Value>> = HashMap::new();
         let mut mappings = self.mappings.clone();
+        discard_mobile_mappings(&mut mappings, &self.activities);
         for activity in self.activities.clone() {
             for task in activity["tasks"].as_array().into_iter().flatten() {
+                if domain::mobile_task_reason(task).is_some() {
+                    continue;
+                }
                 let key = format!(
                     "{}:{}",
                     domain::value_id(&activity["id"]),
@@ -1364,6 +1402,24 @@ fn discard_mismatched_mapping(mappings: &mut Value, key: &str, platform: i64) {
     }
 }
 
+fn discard_mobile_mappings(mappings: &mut Value, activities: &[Value]) {
+    let Some(mappings) = mappings.as_object_mut() else {
+        return;
+    };
+    for activity in activities {
+        for task in activity["tasks"].as_array().into_iter().flatten() {
+            if domain::mobile_task_reason(task).is_some() {
+                let key = format!(
+                    "{}:{}",
+                    domain::value_id(&activity["id"]),
+                    domain::value_id(&task["id"])
+                );
+                mappings.remove(&key);
+            }
+        }
+    }
+}
+
 fn validate_game_platform(game: &Value, platform: i64) -> Result<(), String> {
     if !domain::supported_platform(platform)
         || game["gameInfo"]["platformId"].as_i64() != Some(platform)
@@ -1397,7 +1453,9 @@ fn normalize_status(raw: &Value) -> Result<Value, String> {
     )
 }
 fn validate_manual_task(task: &Value, seconds: f64) -> Result<(), String> {
-    // Use domain rules for mobile exclusion even on a manually overridden task.
+    if let Some(reason) = domain::mobile_task_reason(task) {
+        return Err(reason.to_owned());
+    }
     let activity = json!({"id":"check","tasks":[task]});
     let key = format!("check:{}", domain::value_id(&task["id"]));
     let platform = domain::task_platform(task)?;
@@ -1878,11 +1936,247 @@ mod tests {
     #[test]
     fn manual_mapping_uses_domain_mobile_exclusion() {
         assert!(validate_manual_task(&json!({"id":1,"type":7,"title":"自定任务"}), 60.0).is_ok());
-        for field in ["title", "description"] {
-            let mut task = json!({"id":1,"type":7});
-            task[field] = json!("iOS端加速");
-            assert!(validate_manual_task(&task, 60.0).is_err());
+        for field in ["title", "description", "subTitle"] {
+            for hint in ["手机端", "移动端", "安卓", "iOS", "手游"] {
+                let mut task = json!({"id":1,"type":7,"status":2,"supported":true});
+                task[field] = json!(format!("加速《Warframe》{hint}10分钟"));
+                assert_eq!(
+                    validate_manual_task(&task, 60.0).unwrap_err(),
+                    "这是手机端加速任务，PC 客户端不计入"
+                );
+            }
         }
+        assert!(validate_manual_task(
+            &json!({"id":1,"type":7,"status":2,"supported":true,"sharedAcceleration":"warframe-pc"}),
+            60.0,
+        )
+        .is_ok());
+        for hint in ["PC端", "PS端", "Xbox端", "Switch端", "Steam Deck端"] {
+            assert!(validate_manual_task(
+                &json!({"id":1,"type":7,"title":format!("加速《Warframe》{hint}10分钟")}),
+                600.0,
+            )
+            .is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_tasks_use_generic_rules_without_changing_ids_counts_or_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = Storage::new(root.path().to_owned()).unwrap();
+        let pc = json!({"id":101,"type":7,"status":2,"finishCount":1,
+            "title":"加速《星际战甲》PC端5分钟","supported":true,"gameName":"星际战甲",
+            "seconds":300,"platformId":6});
+        let activities = json!([{"id":"a","tasks":[pc,
+            {"id":"mobile-202","type":7,"status":2,"finishCount":3,"supported":true,
+                "title":"加速《Warframe》移动端10分钟","seconds":600,"gameName":"Warframe",
+                "platformId":6,"sharedAcceleration":"warframe-pc"},
+            {"id":"00202","type":7,"status":1,"finishCount":"4","title":"每日奖励",
+                "supported":true,"seconds":600,"sharedAcceleration":"warframe-pc"}
+        ]}]);
+        let mappings = json!({
+            "a:101":{"gameId":42,"platformId":6,"manual":true,"seconds":300},
+            "a:mobile-202":{"gameId":42,"platformId":6,"manual":true,"seconds":600},
+            "a:00202":{"gameId":42,"platformId":6,"manual":false},
+            "ps:1":{"gameId":8,"platformId":8,"manual":true},
+            "xbox:1":{"gameId":9,"platformId":9},
+            "switch:1":{"gameId":7,"platformId":7},
+            "deck:1":{"gameId":10,"platformId":10}
+        });
+        let run = json!({"status":"interrupted","ownedGameId":42,
+            "pending":{"kind":"claim-reconcile","activityId":"a","taskId":"mobile-202","startedAt":123},
+            "logs":[{"message":"旧领取待核对"}],"results":[{"prizeName":"旧奖品"}]});
+        storage
+            .write(
+                "activities.json",
+                &json!({"entries":[{"activeLink":domain::public_url("a")}],
+            "activities":activities,"updatedAt":123,"legacyMetadata":"keep"}),
+            )
+            .await
+            .unwrap();
+        storage.write("mappings.json", &mappings).await.unwrap();
+        storage.write("run.json", &run).await.unwrap();
+        let run_bytes = std::fs::read(root.path().join("run.json")).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = Backend::new(
+            storage.clone(),
+            listener.local_addr().unwrap().port(),
+            root.path().join("unused.exe"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(backend.activities[0]["tasks"][0], pc);
+        for index in [1, 2] {
+            let task = &backend.activities[0]["tasks"][index];
+            let previous = &activities[0]["tasks"][index];
+            for field in ["id", "status", "finishCount"] {
+                assert_eq!(task[field], previous[field]);
+            }
+            assert_eq!(task["sharedAcceleration"], "warframe-pc");
+        }
+        let mobile = &backend.activities[0]["tasks"][1];
+        assert_eq!(mobile["supported"], false);
+        assert_eq!(mobile["reason"], "这是手机端加速任务，PC 客户端不计入");
+        let generic = &backend.activities[0]["tasks"][2];
+        assert_eq!(generic["supported"], true);
+        assert!(generic.get("reason").is_none());
+        assert_eq!(generic["platformId"], 6);
+        assert!(backend.mappings.get("a:mobile-202").is_none());
+        for key in ["a:101", "a:00202", "ps:1", "xbox:1", "switch:1", "deck:1"] {
+            assert_eq!(backend.mappings[key], mappings[key]);
+        }
+        let saved = storage.read("activities.json", Value::Null).await.unwrap();
+        assert_eq!(saved["activities"], json!(backend.activities));
+        assert_eq!(saved["legacyMetadata"], "keep");
+        assert_eq!(saved["updatedAt"], 123);
+        assert_eq!(
+            storage.read("mappings.json", Value::Null).await.unwrap(),
+            backend.mappings
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("run.json")).unwrap(),
+            run_bytes
+        );
+        assert_eq!(backend.owned_game_id, Some(42));
+        assert!(timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn mobile_mapping_and_claim_are_rejected_before_any_client_request() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = Storage::new(root.path().to_owned()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut backend = Backend::new(
+            storage.clone(),
+            listener.local_addr().unwrap().port(),
+            root.path().join("unused.exe"),
+        )
+        .await
+        .unwrap();
+        backend.entries = vec![json!({"activeLink":domain::public_url("a")})];
+        for name in ["Warframe", "其他游戏"] {
+            let task = json!({"id":"mobile-202","type":7,"status":2,"finishCount":4,"supported":true,
+                "title":format!("加速《{name}》手机端10分钟"),
+                "seconds":600,"platformId":6});
+            backend.activities = vec![json!({"id":"a","tasks":[task]})];
+            let before = backend.activities.clone();
+            let error = backend
+                .set_mapping(&json!({"key":"a:mobile-202","gameId":42,
+                "seconds":600,"platformId":6,"manual":true}))
+                .await
+                .unwrap_err();
+            assert_eq!(error, "这是手机端加速任务，PC 客户端不计入");
+            assert_eq!(backend.activities, before);
+            assert_eq!(backend.mappings, json!({}));
+            let error = backend.claim("a", &json!("mobile-202")).await.unwrap_err();
+            assert!(error.definitive);
+            assert_eq!(error.message, "这是手机端加速任务，PC 客户端不计入");
+        }
+        assert!(!root.path().join("mappings.json").exists());
+        assert!(!root.path().join("activities.json").exists());
+        assert!(!root.path().join("run.json").exists());
+        assert!(timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn catalog_refresh_cleans_mobile_mappings_but_preserves_generic_legacy_tasks() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = Storage::new(root.path().to_owned()).unwrap();
+        let mut backend = Backend::new(storage.clone(), 9222, root.path().join("unused.exe"))
+            .await
+            .unwrap();
+        backend.activities = vec![json!({"id":"a","tasks":[
+            {"id":"old-mobile","type":7,"title":"旧奖励","sharedAcceleration":"warframe-pc"},
+            {"id":"new-mobile","type":7,"title":"加速《Warframe》PC端10分钟"}
+        ]})];
+        backend.mappings = json!({
+            "a:old-mobile":{"gameId":42,"platformId":6,"manual":true},
+            "a:new-mobile":{"gameId":42,"platformId":6,"manual":true},
+            "a:101":{"gameId":42,"platformId":6,"manual":true},
+            "a:ps":{"gameId":8,"platformId":8,"manual":true},
+            "a:xbox":{"gameId":9,"platformId":9},
+            "a:switch":{"gameId":7,"platformId":7},
+            "a:deck":{"gameId":10,"platformId":10}
+        });
+        storage
+            .write("mappings.json", &backend.mappings)
+            .await
+            .unwrap();
+        let run = json!({"pending":{"kind":"claim","activityId":"a","taskId":"old-mobile"}});
+        storage.write("run.json", &run).await.unwrap();
+        let refreshed = domain::simplify_activity(
+            &json!({"activeLink":domain::public_url("a")}),
+            &json!({"tasks":[
+                {"taskId":"new-mobile","type":7,"status":2,"finishCount":5,
+                    "title":"加速《Warframe》手游10分钟"},
+                {"taskId":101,"type":7,"status":1,"title":"加速《Warframe》PC端10分钟"}
+            ]}),
+            &json!({}),
+        )
+        .unwrap();
+        backend
+            .save_catalog(&[], &[refreshed.clone()], &json!(456))
+            .await
+            .unwrap();
+        assert!(backend.mappings.get("a:new-mobile").is_none());
+        for key in [
+            "a:old-mobile",
+            "a:101",
+            "a:ps",
+            "a:xbox",
+            "a:switch",
+            "a:deck",
+        ] {
+            assert!(backend.mappings.get(key).is_some());
+        }
+        assert_eq!(
+            storage.read("mappings.json", Value::Null).await.unwrap(),
+            backend.mappings
+        );
+        let saved = storage.read("activities.json", Value::Null).await.unwrap();
+        assert_eq!(saved["activities"], json!([refreshed]));
+        assert_eq!(saved["activities"][0]["tasks"][0]["status"], 2);
+        assert_eq!(saved["activities"][0]["tasks"][0]["finishCount"], 5);
+        assert_eq!(saved["activities"][0]["tasks"][0]["supported"], false);
+        assert_eq!(storage.read("run.json", Value::Null).await.unwrap(), run);
+    }
+
+    #[tokio::test]
+    async fn resolution_removes_mobile_mappings_without_searching() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = Storage::new(root.path().to_owned()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut backend = Backend::new(
+            storage.clone(),
+            listener.local_addr().unwrap().port(),
+            root.path().join("unused.exe"),
+        )
+        .await
+        .unwrap();
+        backend.activities = vec![json!({"id":"a","tasks":[
+            {"id":"mobile-202","type":7,"status":2,"title":"加速《Warframe》安卓端10分钟",
+                "supported":true,"gameName":"Warframe","seconds":600,"sharedAcceleration":"warframe-pc"},
+            {"id":101,"type":7,"status":1,"title":"加速《Warframe》PC端10分钟",
+                "supported":true,"gameName":"Warframe","seconds":600,"platformId":6}
+        ]})];
+        backend.mappings = json!({
+            "a:mobile-202":{"gameId":42,"manual":true},
+            "a:101":{"gameId":42,"manual":true,"platformId":6}
+        });
+        backend.resolve_games().await.unwrap();
+        assert!(backend.mappings.get("a:mobile-202").is_none());
+        assert_eq!(backend.mappings["a:101"]["gameId"], 42);
+        assert_eq!(
+            storage.read("mappings.json", Value::Null).await.unwrap(),
+            backend.mappings
+        );
+        assert!(timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err());
     }
 
     #[tokio::test]

@@ -1,8 +1,9 @@
+import { readFileSync } from 'node:fs';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const desktop = vi.hoisted(() => ({ invoke: vi.fn(), isTauri: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => desktop);
-import { detectClientInstallations, dispatch, getState, openDataDir, openExternal, pickClientDirectory, requestExit } from '../src/lib/ipc';
+import { checkUpdate, detectClientInstallations, dispatch, getState, openDataDir, openExternal, openLatestRelease, pickClientDirectory, requestExit } from '../src/lib/ipc';
 import {
   canConfigure,
   duration,
@@ -23,6 +24,33 @@ import { filterActivities, focusedActivity } from '../src/lib/workspace';
 import { render } from 'svelte/server';
 import MembershipInfo from '../src/lib/MembershipInfo.svelte';
 import ClientSettingsPanel from '../src/lib/ClientSettingsPanel.svelte';
+import UpdateBanner from '../src/lib/UpdateBanner.svelte';
+
+describe('更新横幅', () => {
+  it('仅在启动时检查一次更新，定时器只用于本机状态轮询', () => {
+    // Node 环境不执行 onMount，直接检查应用的生命周期调度。
+    const source = readFileSync(new URL('../src/App.svelte', import.meta.url), 'utf8');
+    const lifecycle = source.match(/onMount\(\(\) => \{([\s\S]*?)\n  \}\);/)?.[1] ?? '';
+    expect(lifecycle.match(/refreshUpdate\(\)/g)).toHaveLength(1);
+    expect(lifecycle).toContain('void refreshUpdate();');
+    expect(lifecycle.match(/window\.setInterval\(/g)).toHaveLength(1);
+    expect(lifecycle).toContain('const timer = window.setInterval(() => { void refreshState(); }, 2000);');
+    expect(lifecycle).toContain('window.clearInterval(timer);');
+    expect(lifecycle).not.toContain('updateTimer');
+  });
+
+  it('显示新旧版本、下载入口和关闭按钮', () => {
+    const { body } = render(UpdateBanner, { props: {
+      update: { currentVersion: '0.3.2', latestVersion: '0.3.10' },
+      onopen: async () => {}, onclose: () => {},
+    } });
+    expect(body).toContain('发现新版本 v0.3.10');
+    expect(body).toContain('当前 v0.3.2');
+    expect(body).toContain('查看更新');
+    expect(body).toContain('暂时关闭更新提示');
+    expect(body).toContain('role="status"');
+  });
+});
 
 describe('客户端设置面板', () => {
   const props = { settings: { executablePath: 'C:\\Games\\biubiu\\biubiu.exe', debugPort: 9333 },
@@ -157,17 +185,19 @@ describe('前端格式化与输入校验', () => {
     expect(canConfigure(task({ description: '移动端任务' }))).toBe(false);
   });
 
-  it('仅根据后端标记开放 Warframe 移动奖励的 PC 配置并说明共享加速', () => {
-    const mobile = task({ title: '加速《Warframe》手机端10分钟', platformId: 6, sharedAcceleration: 'warframe-pc' });
-    expect(canConfigure(mobile)).toBe(true);
-    expect(taskPlatformId(mobile)).toBe(6);
-    expect(mappingDescription(mobile)).toContain('移动版奖励共用 Warframe PC 加速');
-    const mapping: GameMapping = { gameId: 42, gameName: 'Warframe', platformId: 6, seconds: 600 };
-    expect(mappingDescription(mobile, mapping)).toBe('PC · Warframe · 上次 / 默认区服 · 10 分钟 · 移动版奖励共用 Warframe PC 加速');
-    expect(canConfigure(task({ title: mobile.title }))).toBe(false);
-    expect(canConfigure({ ...mobile, type: 11 })).toBe(false);
-    expect(canConfigure({ ...mobile, platformId: 8 })).toBe(false);
-    expect(mappingDescription(mobile, { ...mapping, platformId: 9 })).toContain('旧映射需重新匹配');
+  it.each(['Warframe', '其他游戏'])('%s 与其他任务使用相同的平台和配置规则', (name) => {
+    const mobile = task({ title: `加速《${name}》手机端10分钟`, platformId: 6,
+      reason: '这是手机端加速任务，PC 客户端不计入' });
+    const mapping: GameMapping = { gameId: 42, gameName: name, platformId: 6, seconds: 600 };
+    for (const suffix of ['手机端', '移动端', '安卓端', '安卓', 'iOS端', 'iOS', '手游端', '手游']) {
+      const current = { ...mobile, title: `加速《${name}》${suffix}10分钟` };
+      expect(canConfigure(current)).toBe(false);
+      expect(mappingDescription(current, mapping)).toBe('这是手机端加速任务，PC 客户端不计入');
+    }
+    const pc = { ...task({ title: `加速《${name}》PC端10分钟`, platformId: 6 }), sharedAcceleration: 'warframe-pc' };
+    expect(canConfigure(pc)).toBe(true);
+    expect(mappingDescription(pc, mapping)).toBe(`PC · ${name} · 上次 / 默认区服 · 10 分钟`);
+    expect(canConfigure(task({ title: '每日奖励', reason: mobile.reason }))).toBe(false);
   });
 
   it('使用官方平台编号；有主机提示的旧任务不默认成 PC', () => {
@@ -276,6 +306,17 @@ describe('桌面 IPC 契约', () => {
     desktop.invoke.mockResolvedValue({ expiresAt: null });
     await dispatch({ action: 'membership', payload: {} });
     expect(desktop.invoke).toHaveBeenCalledWith('dispatch', { action: 'membership', payload: {} });
+  });
+
+  it('更新检测独立于活动调度，跳转使用固定 Release 命令', async () => {
+    const update = { currentVersion: '0.3.2', latestVersion: '0.3.10' };
+    desktop.invoke.mockResolvedValueOnce(update).mockResolvedValueOnce(undefined).mockResolvedValueOnce(null);
+    expect(await checkUpdate()).toEqual(update);
+    await openLatestRelease();
+    expect(await checkUpdate()).toBeNull();
+    expect(desktop.invoke.mock.calls).toEqual([
+      ['check_update', undefined], ['open_latest_release', undefined], ['check_update', undefined],
+    ]);
   });
 
   it('停止、外链、记录目录与退出使用固定的桌面命令', async () => {

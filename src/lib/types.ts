@@ -18,7 +18,6 @@ export interface ActivityTask {
   awardNum?: number;
   finishCount?: number;
   supported?: boolean;
-  sharedAcceleration?: 'warframe-pc';
   reason?: string;
   gameName?: string | null;
   platformId?: number | null;
@@ -166,6 +165,11 @@ export interface Snapshot {
   run: RunState;
   dataDir?: string;
   version?: string;
+}
+
+export interface ReleaseUpdate {
+  currentVersion: string;
+  latestVersion: string;
 }
 
 export type DispatchRequest =

@@ -491,6 +491,16 @@ impl Engine {
                 .as_array()
                 .and_then(|ts| ts.iter().find(|t| t["id"] == task["taskId"]));
             match fresh {
+                Some(t)
+                    if crate::domain::mobile_task_reason(t).is_some()
+                        || crate::domain::mobile_task_reason(task).is_some() =>
+                {
+                    self.log(
+                        format!("跳过手机端任务：{}", t["title"].as_str().unwrap_or("")),
+                        "warn",
+                    )
+                    .await?
+                }
                 Some(t) if t["status"] == 3 => self.draw_tickets(id, Some(activity)).await?,
                 Some(t) if t["status"] == 2 => self.collect(task).await?,
                 Some(t)
@@ -661,6 +671,9 @@ impl Engine {
     }
     async fn collect(&self, task: &Value) -> Result<(), String> {
         self.assert_running().await?;
+        if let Some(reason) = crate::domain::mobile_task_reason(task) {
+            return Err(reason.to_owned());
+        }
         let id = text(task, "activityId")?;
         let mut activity = self.refresh(id).await?;
         check_activity(&activity)?;
@@ -669,6 +682,9 @@ impl Engine {
             .and_then(|ts| ts.iter().find(|t| t["id"] == task["taskId"]))
             .cloned()
             .ok_or("任务已更新，请重新扫描")?;
+        if let Some(reason) = crate::domain::mobile_task_reason(&current) {
+            return Err(reason.to_owned());
+        }
         if current["status"] != 3 {
             // 与旧 runner 一致，计时达标后允许报告仍处于 status=1 的任务；
             // 部分活动只有 reportTaskFinish 后才更新状态，不能强制等待 status=2。
@@ -1146,7 +1162,7 @@ mod tests {
         let mock = Mock::new(pc_status, 0);
         {
             let mut data = mock.data.lock().unwrap();
-            // 混合数字/字符串编号，防止共享加速时把移动奖励替换成 PC taskId。
+            // 保留两端原始编号，PC 领取不能改变移动奖励记录。
             data.activity["tasks"] = json!([
                 task(json!(101), "加速《Warframe》PC端达到1秒", pc_status),
                 task(
@@ -1157,20 +1173,26 @@ mod tests {
             ]);
             data.mappings = json!({
                 "a:101":{"gameId":42,"areaId":9,"gameName":"Warframe","platformId":6},
-                "a:mobile-202":{"gameId":42,"areaId":9,"gameName":"Warframe","platformId":6}
+                "a:mobile-202":{"gameId":42,"areaId":9,"gameName":"Warframe","platformId":6,"manual":true,"seconds":2}
             });
         }
         mock
     }
 
     #[tokio::test]
-    async fn warframe_pc_and_mobile_share_one_pc_start_and_claim_their_own_rewards() {
+    async fn warframe_pc_accelerates_and_claims_without_timing_the_legacy_mobile_task() {
         let root = tempfile::tempdir().unwrap();
         let storage = Storage::new(root.path().to_owned()).unwrap();
         let mock = warframe_mock(1, 1);
+        {
+            let mut data = mock.data.lock().unwrap();
+            data.activity["tasks"][1]["supported"] = json!(true);
+            data.activity["tasks"][1]["sharedAcceleration"] = json!("warframe-pc");
+            data.activity["tasks"][1]["seconds"] = json!(2);
+        }
         let mut engine = fixture(&mock, storage.clone()).await;
         // accelerate 用局部 elapsed 和 std::time::Instant，run.elapsed 不能快进。
-        // 仅缩短测试实例的采样间隔/缓冲，保留真实 1 秒/2 秒合法阈值。
+        // 仅缩短测试实例的采样间隔/缓冲，保留 PC 的真实 1 秒合法阈值。
         let test_engine = Arc::get_mut(&mut engine).unwrap();
         test_engine.tick = Duration::from_millis(5);
         test_engine.buffer = 0.0;
@@ -1178,12 +1200,12 @@ mod tests {
         let groups = plan["groups"].as_array().unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0]["platformId"], 6);
-        assert_eq!(groups[0]["seconds"], 2);
+        assert_eq!(groups[0]["seconds"], 1);
         assert_eq!(groups[0]["tasks"][0]["taskId"], 101);
         assert_eq!(groups[0]["tasks"][0]["seconds"], 1);
-        assert_eq!(groups[0]["tasks"][1]["taskId"], "mobile-202");
-        assert_eq!(groups[0]["tasks"][1]["seconds"], 2);
-        assert!(plan["skipped"].as_array().unwrap().is_empty());
+        assert_eq!(groups[0]["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(plan["skipped"][0]["key"], "a:mobile-202");
+        assert_eq!(plan["totalSeconds"], 1);
 
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -1193,16 +1215,13 @@ mod tests {
         .unwrap();
         let snapshot = engine.snapshot().await;
         assert_eq!(snapshot["run"]["status"], "completed");
-        assert!(snapshot["run"]["elapsed"].as_f64().unwrap() >= 2.0);
+        assert!(snapshot["run"]["elapsed"].as_f64().unwrap() >= 1.0);
         assert!(snapshot["run"]["pending"].is_null());
         assert!(snapshot["run"]["ownedGameId"].is_null());
-        assert_eq!(snapshot["run"]["results"].as_array().unwrap().len(), 2);
+        assert_eq!(snapshot["run"]["results"].as_array().unwrap().len(), 1);
         assert_eq!(snapshot["activities"][0]["tasks"][0]["status"], 3);
-        assert_eq!(snapshot["activities"][0]["tasks"][1]["status"], 3);
-        assert_eq!(
-            snapshot["activities"][0]["tasks"][1]["sharedAcceleration"],
-            "warframe-pc"
-        );
+        assert_eq!(snapshot["activities"][0]["tasks"][1]["status"], 1);
+        assert_eq!(snapshot["activities"][0]["tasks"][1]["finishCount"], 0);
         assert_eq!(snapshot["activities"][0]["tickets"], 0);
         assert_eq!(
             storage.read("run.json", Value::Null).await.unwrap()["pending"],
@@ -1210,14 +1229,7 @@ mod tests {
         );
         let data = mock.data.lock().unwrap();
         assert_eq!(data.starts, vec![(42, Some(9), 6)]);
-        // reverse pending 遍历时若错误地只用组最大值，两任务会以相反顺序领取。
-        assert_eq!(
-            data.claims,
-            vec![
-                ("a".to_owned(), json!(101)),
-                ("a".to_owned(), json!("mobile-202"))
-            ]
-        );
+        assert_eq!(data.claims, vec![("a".to_owned(), json!(101))]);
         assert!(!data.active);
         assert_eq!(
             data.events
@@ -1225,88 +1237,199 @@ mod tests {
                 .filter(|event| matches!(event.as_str(), "start" | "claim" | "draw" | "stop"))
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            vec!["start", "claim", "draw", "claim", "draw", "stop"]
+            vec!["start", "claim", "draw", "stop"]
         );
     }
 
     #[tokio::test]
-    async fn warframe_claimed_pc_only_collects_ready_mobile_without_starting() {
+    async fn warframe_ready_mobile_reward_is_not_claimed_when_pc_is_already_claimed() {
         let root = tempfile::tempdir().unwrap();
         let mock = warframe_mock(3, 2);
+        {
+            let mut data = mock.data.lock().unwrap();
+            data.activity["tasks"][1]["supported"] = json!(true);
+            data.activity["tasks"][1]["sharedAcceleration"] = json!("warframe-pc");
+        }
         let engine = fixture(&mock, Storage::new(root.path().to_owned()).unwrap()).await;
         execute(&engine).await;
         let snapshot = engine.snapshot().await;
-        assert_eq!(snapshot["run"]["status"], "completed");
+        assert_eq!(snapshot["run"]["status"], "error");
+        assert_eq!(
+            snapshot["run"]["message"],
+            "所选活动没有可运行任务或可用抽奖次数"
+        );
         assert!(snapshot["run"]["pending"].is_null());
-        assert_eq!(snapshot["run"]["results"].as_array().unwrap().len(), 1);
-        assert_eq!(snapshot["run"]["plan"]["groups"][0]["seconds"], 0);
+        assert_eq!(snapshot["run"]["results"], json!([]));
+        assert_eq!(snapshot["plan"]["groups"], json!([]));
         assert_eq!(snapshot["activities"][0]["tasks"][0]["status"], 3);
-        assert_eq!(snapshot["activities"][0]["tasks"][1]["status"], 3);
+        assert_eq!(snapshot["activities"][0]["tasks"][1]["status"], 2);
         let data = mock.data.lock().unwrap();
         assert!(data.starts.is_empty());
-        assert_eq!(data.claims, vec![("a".to_owned(), json!("mobile-202"))]);
-        assert_eq!(
-            data.events.iter().filter(|event| *event == "draw").count(),
-            1
-        );
+        assert!(data.claims.is_empty());
+        assert!(!data.events.iter().any(|event| event == "draw"));
         assert!(!data.events.iter().any(|event| event == "stop"));
     }
 
     #[tokio::test]
-    async fn warframe_mobile_timeout_keeps_original_pending_id_and_blocks_resubmission() {
+    async fn warframe_ready_pc_reward_is_claimed_while_ready_mobile_reward_is_untouched() {
         let root = tempfile::tempdir().unwrap();
         let storage = Storage::new(root.path().to_owned()).unwrap();
         let mock = warframe_mock(2, 2);
         {
             let mut data = mock.data.lock().unwrap();
-            data.claim_error = Some(ApiError {
-                message: "模拟移动奖励领取超时".to_owned(),
-                definitive: false,
-            });
-            data.claim_error_task = Some(json!("mobile-202"));
+            data.activity["tasks"][1]["supported"] = json!(true);
+            data.activity["tasks"][1]["sharedAcceleration"] = json!("warframe-pc");
         }
         let engine = fixture(&mock, storage.clone()).await;
         execute(&engine).await;
         let snapshot = engine.snapshot().await;
-        assert_eq!(snapshot["run"]["status"], "error");
-        let pending = &snapshot["run"]["pending"];
-        assert_eq!(pending["kind"], "claim");
-        assert_eq!(pending["activityId"], "a");
-        assert_eq!(pending["taskId"], "mobile-202");
+        assert_eq!(snapshot["run"]["status"], "completed");
+        assert!(snapshot["run"]["pending"].is_null());
         assert_eq!(snapshot["activities"][0]["tasks"][0]["status"], 3);
         assert_eq!(snapshot["activities"][0]["tasks"][1]["status"], 2);
         assert_eq!(snapshot["run"]["results"].as_array().unwrap().len(), 1);
         assert_eq!(
             storage.read("run.json", Value::Null).await.unwrap()["pending"],
-            *pending
+            Value::Null
         );
-        assert!(engine
-            .dispatch("start", json!({"ids":["a"]}))
-            .await
-            .unwrap_err()
-            .contains("待核对"));
-        let restored = Engine::new(Box::new(MockService(mock.clone())), storage, 0)
-            .await
-            .unwrap();
-        assert_eq!(restored.snapshot().await["run"]["pending"], *pending);
-        assert!(restored
-            .dispatch("start", json!({"ids":["a"]}))
-            .await
-            .unwrap_err()
-            .contains("待核对"));
         let data = mock.data.lock().unwrap();
-        assert_eq!(
-            data.claims,
-            vec![
-                ("a".to_owned(), json!(101)),
-                ("a".to_owned(), json!("mobile-202"))
-            ]
-        );
+        assert_eq!(data.claims, vec![("a".to_owned(), json!(101))]);
         assert!(data.starts.is_empty());
         assert_eq!(
             data.events.iter().filter(|event| *event == "draw").count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn ready_tasks_ignore_legacy_sharing_marker_for_every_game_name() {
+        for name in ["Warframe", "其他游戏"] {
+            for marked in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let mock = Mock::new(2, 0);
+                {
+                    let mut data = mock.data.lock().unwrap();
+                    data.activity["tasks"][0]["title"] = json!(format!("加速《{name}》PC端10分钟"));
+                    if marked {
+                        data.activity["tasks"][0]["sharedAcceleration"] = json!("warframe-pc");
+                    }
+                }
+                let engine = fixture(&mock, Storage::new(root.path().to_owned()).unwrap()).await;
+                assert_eq!(engine.snapshot().await["plan"]["totalSeconds"], 0);
+                execute(&engine).await;
+                let snapshot = engine.snapshot().await;
+                assert_eq!(snapshot["run"]["status"], "completed");
+                assert!(snapshot["run"]["pending"].is_null());
+                assert_eq!(snapshot["activities"][0]["tasks"][0]["status"], 3);
+                assert_eq!(snapshot["run"]["results"].as_array().unwrap().len(), 1);
+                let data = mock.data.lock().unwrap();
+                assert!(data.starts.is_empty());
+                assert_eq!(data.claims, vec![("a".to_owned(), json!(1))]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_groups_and_direct_collection_reject_mobile_tasks_in_every_state() {
+        for status in [1, 2, 3] {
+            for cached_reason_only in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let mock = warframe_mock(3, status);
+                {
+                    let mut data = mock.data.lock().unwrap();
+                    data.activity["tasks"][1]["supported"] = json!(true);
+                    if cached_reason_only {
+                        data.activity["tasks"][1]["title"] = json!("旧奖励");
+                    }
+                }
+                let engine = fixture(&mock, Storage::new(root.path().to_owned()).unwrap()).await;
+                // 旧计划没有说明，执行时必须以最新任务要求再次排除。
+                let task = json!({"activityId":"a","taskId":"mobile-202","title":"旧队列任务",
+                    "seconds":2,"status":status,"manual":true});
+                let group =
+                    json!({"gameId":42,"gameName":"Warframe","platformId":6,"tasks":[task]});
+                engine.execute_group(&group).await.unwrap();
+                assert_eq!(
+                    engine.collect(&task).await.unwrap_err(),
+                    "这是手机端加速任务，PC 客户端不计入"
+                );
+                let snapshot = engine.snapshot().await;
+                assert_eq!(snapshot["run"]["elapsed"], 0);
+                assert!(snapshot["run"]["pending"].is_null());
+                assert!(snapshot["run"]["ownedGameId"].is_null());
+                assert_eq!(snapshot["activities"][0]["tasks"][1]["status"], status);
+                let data = mock.data.lock().unwrap();
+                assert!(data.starts.is_empty());
+                assert!(data.claims.is_empty());
+                assert!(!data.events.iter().any(|event| event == "draw"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_survives_legacy_cache_loading_and_blocks_resubmission() {
+        for kind in ["claim", "claim-reconcile"] {
+            let root = tempfile::tempdir().unwrap();
+            let storage = Storage::new(root.path().to_owned()).unwrap();
+            let pending =
+                json!({"kind":kind,"activityId":"a","taskId":"mobile-202","startedAt":123});
+            let saved = json!({"status":"running","day":day_key(now_ms()),"pending":pending,
+                "ownedGameId":42,"logs":[{"message":"移动奖励结果待核对"}],
+                "results":[{"prizeName":"旧 PC 奖品"}]});
+            storage.write("run.json", &saved).await.unwrap();
+            storage
+                .write(
+                    "activities.json",
+                    &json!({"entries":[{"activeLink":crate::domain::public_url("a")}],
+                    "activities":[{"id":"a","tickets":0,"tasks":[
+                        {"id":"mobile-202","type":7,"status":2,"finishCount":4,"title":"旧奖励",
+                            "supported":true,"seconds":2,"sharedAcceleration":"warframe-pc"}
+                    ]}]}),
+                )
+                .await
+                .unwrap();
+            storage
+                .write(
+                    "mappings.json",
+                    &json!({"a:mobile-202":{"gameId":42,"manual":true,"seconds":2}}),
+                )
+                .await
+                .unwrap();
+            let original_run_bytes = std::fs::read(root.path().join("run.json")).unwrap();
+            let backend = Backend::new(storage.clone(), 9222, root.path().join("unused.exe"))
+                .await
+                .unwrap();
+            let engine = Engine::new(Box::new(backend), storage.clone(), 0)
+                .await
+                .unwrap();
+            let snapshot = engine.snapshot().await;
+            assert_eq!(snapshot["activities"][0]["tasks"][0]["supported"], true);
+            assert_eq!(
+                snapshot["activities"][0]["tasks"][0]["sharedAcceleration"],
+                "warframe-pc"
+            );
+            assert_eq!(snapshot["activities"][0]["tasks"][0]["id"], "mobile-202");
+            assert_eq!(snapshot["activities"][0]["tasks"][0]["status"], 2);
+            assert_eq!(snapshot["activities"][0]["tasks"][0]["finishCount"], 4);
+            assert_eq!(snapshot["plan"]["groups"].as_array().unwrap().len(), 1);
+            assert_eq!(snapshot["plan"]["totalSeconds"], 0);
+            assert_eq!(snapshot["mappings"]["a:mobile-202"]["gameId"], 42);
+            assert_eq!(snapshot["run"]["status"], "interrupted");
+            assert_eq!(snapshot["run"]["pending"], pending);
+            assert_eq!(snapshot["run"]["ownedGameId"], 42);
+            assert_eq!(snapshot["run"]["logs"], saved["logs"]);
+            assert_eq!(snapshot["run"]["results"], saved["results"]);
+            assert!(engine
+                .dispatch("start", json!({"ids":["a"]}))
+                .await
+                .unwrap_err()
+                .contains("待核对"));
+            assert_eq!(engine.snapshot().await["run"]["pending"], pending);
+            assert_eq!(
+                std::fs::read(root.path().join("run.json")).unwrap(),
+                original_run_bytes
+            );
+        }
     }
 
     #[tokio::test]
