@@ -17,9 +17,11 @@ function Get-StreamHash($Stream) {
     }
 }
 
+# .NET Framework 枚举文件时可能保留输入路径的写法，先统一暂存目录路径。
+$Source = [System.IO.Path]::GetFullPath($Source)
+$executable = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($Source, $EntryName))
 $files = @([System.IO.Directory]::EnumerateFiles($Source, '*', [System.IO.SearchOption]::AllDirectories))
-$executable = [System.IO.Path]::GetFullPath((Join-Path $Source $EntryName))
-if ($files.Count -ne 1 -or $files[0] -ine $executable) {
+if ($files.Count -ne 1 -or -not [string]::Equals($files[0], $executable, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Unexpected portable ZIP contents; expected only $EntryName"
 }
 $output = [System.IO.Compression.ZipFile]::Open($Destination, [System.IO.Compression.ZipArchiveMode]::Create)
@@ -36,7 +38,7 @@ try {
     if ($archive.Entries.Count -ne 1 -or $archive.Entries[0].FullName -cne $EntryName) {
         throw "Unexpected portable ZIP contents; expected only $EntryName"
     }
-    $file = [System.IO.File]::OpenRead((Join-Path $Source $EntryName))
+    $file = [System.IO.File]::OpenRead($executable)
     $entry = $archive.Entries[0].Open()
     try {
         if ((Get-StreamHash $file) -cne (Get-StreamHash $entry)) {

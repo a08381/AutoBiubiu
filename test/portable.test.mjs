@@ -177,6 +177,18 @@ test('Windows archiver produces and hash-verifies a real single-entry ZIP', { sk
   await noTemporaryFiles(release);
 });
 
+test('Windows archiver accepts a staging path written with forward slashes', { skip: process.platform !== 'win32' }, async t => {
+  const { root, release, archive } = await fixture(t);
+  const { execute } = runner({ onArchive: (command, args, settings) => {
+    const sourceIndex = args.indexOf('-Source') + 1;
+    args[sourceIndex] = args[sourceIndex].replaceAll('\\', '/');
+    return powershell(command, args, settings);
+  } });
+  await buildPortable(options(root, execute, { env: { ...process.env, CARGO_TARGET_DIR: '', CARGO_BUILD_TARGET: '' } }));
+  assert.equal((await readFile(archive)).subarray(0, 2).toString('ascii'), 'PK');
+  await noTemporaryFiles(release);
+});
+
 test('Windows archiver rejects an extra staged data file and keeps the old ZIP', { skip: process.platform !== 'win32' }, async t => {
   const { root, release, archive } = await fixture(t);
   const { execute } = runner({ onArchive: async (command, args, settings) => {
