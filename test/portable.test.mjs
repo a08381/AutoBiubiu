@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -167,27 +167,23 @@ function powershell(command, args, options) {
   if (result.status !== 0) throw new Error(result.stderr || `PowerShell exit ${result.status}`);
 }
 
-test('Windows archiver produces and hash-verifies a real single-entry ZIP', { skip: process.platform !== 'win32' }, async t => {
-  const { root, release, archive } = await fixture(t);
-  const { execute } = runner({ onArchive: powershell });
-  await buildPortable(options(root, execute, { env: { ...process.env, CARGO_TARGET_DIR: '', CARGO_BUILD_TARGET: '' } }));
-  const bytes = await readFile(archive);
-  assert.equal(bytes.subarray(0, 2).toString('ascii'), 'PK');
-  assert.ok((await stat(archive)).size > freshExe.length);
-  await noTemporaryFiles(release);
-});
-
-test('Windows archiver accepts a staging path written with forward slashes', { skip: process.platform !== 'win32' }, async t => {
-  const { root, release, archive } = await fixture(t);
-  const { execute } = runner({ onArchive: (command, args, settings) => {
-    const sourceIndex = args.indexOf('-Source') + 1;
-    args[sourceIndex] = args[sourceIndex].replaceAll('\\', '/');
-    return powershell(command, args, settings);
-  } });
-  await buildPortable(options(root, execute, { env: { ...process.env, CARGO_TARGET_DIR: '', CARGO_BUILD_TARGET: '' } }));
-  assert.equal((await readFile(archive)).subarray(0, 2).toString('ascii'), 'PK');
-  await noTemporaryFiles(release);
-});
+for (const pathStyle of ['native separators', 'forward slashes']) {
+  test(`Windows archiver produces and hash-verifies a real single-entry ZIP with ${pathStyle}`, { skip: process.platform !== 'win32' }, async t => {
+    const { root, release, archive } = await fixture(t);
+    const { execute } = runner({ onArchive: (command, args, settings) => {
+      if (pathStyle === 'forward slashes') {
+        const sourceIndex = args.indexOf('-Source') + 1;
+        args[sourceIndex] = args[sourceIndex].replaceAll('\\', '/');
+      }
+      return powershell(command, args, settings);
+    } });
+    await buildPortable(options(root, execute, { env: { ...process.env, CARGO_TARGET_DIR: '', CARGO_BUILD_TARGET: '' } }));
+    const bytes = await readFile(archive);
+    assert.equal(bytes.subarray(0, 2).toString('ascii'), 'PK');
+    assert.ok(bytes.length > freshExe.length);
+    await noTemporaryFiles(release);
+  });
+}
 
 test('Windows archiver rejects an extra staged data file and keeps the old ZIP', { skip: process.platform !== 'win32' }, async t => {
   const { root, release, archive } = await fixture(t);

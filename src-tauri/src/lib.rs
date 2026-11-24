@@ -3,6 +3,7 @@ mod client_platform;
 mod client_settings;
 mod domain;
 mod engine;
+mod entitlement;
 mod lease;
 mod membership;
 mod smoke;

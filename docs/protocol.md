@@ -27,9 +27,10 @@
 | --- | --- |
 | `get_active_center_info` | 读取活动中心条目 |
 | `get-user-info` | 检查登录状态，并只提取会员到期时间与会员类型 |
-| `update-user-info` | 用户点击会员刷新时，让客户端更新账号资料 |
+| `update-user-info` | 手动刷新或队列核对会员权益时，让客户端更新账号资料 |
 | `search-game-list-combine` | 按任务的 `searchPlatformIds` 搜索对应平台游戏 |
-| `get-games-by-ids`、`get-local-game-config` | 读取游戏、区服与加速模式 |
+| `get-free-game-library` | 读取免费目录中的游戏编号，只用于排队 |
+| `get-games-by-ids`、`get-local-game-config` | 读取游戏、限免时段、区服与加速模式 |
 | `start-accelerate`、`get-accelerate-data`、`stop-accelerate` | 启动、核对与停止实际加速 |
 | `open-webview` | 打开活动页面并沿用客户端会话 |
 

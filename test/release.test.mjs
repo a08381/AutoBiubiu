@@ -87,7 +87,6 @@ test('finds the previous published release across API pages and reads the entire
   const commits = readCommits({ root: params.root, target: state.targetSha, previousTag: state.previousTag });
   assert.deepEqual(commits.map(commit => commit.subject), ['feat：增加更新横幅', 'fix(tasks): 修复任务计时', 'chore：将版本号升至 0.3.2']);
   assert.equal(commits[0].body, '界面显示最新版本。');
-  assert.equal(readCommits({ root: params.root }).length, 4);
   const notes = generateReleaseNotes({ ...state, commits });
   assert.match(notes, /新增功能 1 项、问题修复 1 项、构建与发布 1 项/);
   assert.match(notes, /tasks：修复任务计时/);

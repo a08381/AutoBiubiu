@@ -80,6 +80,7 @@ export interface TaskGroup {
   platformId?: number | null;
   areaId?: number | null;
   gameName: string;
+  access?: 'member' | 'limited-free' | 'free-catalog';
   tasks: PlannedTask[];
   seconds: number;
 }

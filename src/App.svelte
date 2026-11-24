@@ -109,14 +109,16 @@
   const connectionText = $derived(stateError ? '本机状态暂未同步' : !snapshot ? '正在读取本机状态' : connected
     ? snapshot.connection.loggedIn ? '客户端已连接 · 已登录' : '客户端已连接 · 请登录'
     : '尚未连接客户端');
+  const accessLabels = { member: '会员有效', 'limited-free': '限免时段', 'free-catalog': '免费目录' };
   const runTitle = $derived(run?.status === 'running' && run.group
-    ? `正在加速 · ${platformLabel(run.group.platformId ?? PC_PLATFORM_ID)} · ${run.group.gameName}`
+    ? `正在加速 · ${platformLabel(run.group.platformId ?? PC_PLATFORM_ID)} · ${run.group.gameName}${run.group.access ? ` · ${accessLabels[run.group.access]}` : ''}`
     : run ? statusLabels[run.status] || run.status : '读取运行状态');
-  const runDetail = $derived(run?.status === 'running'
-    ? `本组 ${run.group?.tasks.length ?? 0} 个任务 · 达标后等待 20 秒结算缓冲，再核对并领取`
+  const runDetail = $derived(run?.status === 'running' && run.group
+    ? `本组 ${run.group.tasks.length} 个任务 · 达标后等待 20 秒结算缓冲，再核对并领取`
     : run?.status === 'stopping' ? '正在等待当前请求结束并停止加速，请稍候。'
-    : run?.status === 'completed' && rewards[0]?.prizeName ? `最近获得：${rewards[0].prizeName} · 详细结果已保存在本机`
-    : run?.message || '选好活动，连接客户端后开始；相同游戏与区服会合并计时。');
+    : run?.status === 'completed' && rewards[0]?.prizeName
+      ? [run.message, `最近获得：${rewards[0].prizeName}`].filter(Boolean).join(' · ')
+      : run?.message || '选好活动，连接客户端后开始；相同游戏与区服会合并计时。');
 
   function report(error: unknown, dialog?: DialogName): void {
     if (!mounted) return;

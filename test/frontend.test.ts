@@ -177,27 +177,22 @@ describe('前端格式化与输入校验', () => {
     }
   });
 
-  it('区分可配置的加速任务与移动端任务', () => {
+  it('仅允许配置非移动端的加速任务', () => {
     expect(canConfigure(task())).toBe(true);
     expect(canConfigure(task({ title: '加速《GTA6》PS5 版', platformId: 8 }))).toBe(true);
     expect(canConfigure(task({ type: 11 }))).toBe(false);
-    expect(canConfigure(task({ title: '加速游戏 iOS端 10分钟' }))).toBe(false);
+    for (const hint of ['手机端', '移动端', '安卓', 'iOS', '手游']) {
+      expect(canConfigure(task({ title: `加速《游戏》${hint}10分钟` })), hint).toBe(false);
+    }
     expect(canConfigure(task({ description: '移动端任务' }))).toBe(false);
   });
 
-  it.each(['Warframe', '其他游戏'])('%s 与其他任务使用相同的平台和配置规则', (name) => {
-    const mobile = task({ title: `加速《${name}》手机端10分钟`, platformId: 6,
-      reason: '这是手机端加速任务，PC 客户端不计入' });
-    const mapping: GameMapping = { gameId: 42, gameName: name, platformId: 6, seconds: 600 };
-    for (const suffix of ['手机端', '移动端', '安卓端', '安卓', 'iOS端', 'iOS', '手游端', '手游']) {
-      const current = { ...mobile, title: `加速《${name}》${suffix}10分钟` };
-      expect(canConfigure(current)).toBe(false);
-      expect(mappingDescription(current, mapping)).toBe('这是手机端加速任务，PC 客户端不计入');
-    }
-    const pc = { ...task({ title: `加速《${name}》PC端10分钟`, platformId: 6 }), sharedAcceleration: 'warframe-pc' };
-    expect(canConfigure(pc)).toBe(true);
-    expect(mappingDescription(pc, mapping)).toBe(`PC · ${name} · 上次 / 默认区服 · 10 分钟`);
-    expect(canConfigure(task({ title: '每日奖励', reason: mobile.reason }))).toBe(false);
+  it('仅有后台移动端说明时也禁止配置，不显示已有映射', () => {
+    const reason = '这是手机端加速任务，PC 客户端不计入';
+    const mobile = task({ platformId: 6, reason });
+    const mapping: GameMapping = { gameId: 42, gameName: '测试游戏', platformId: 6, seconds: 600 };
+    expect(canConfigure(mobile)).toBe(false);
+    expect(mappingDescription(mobile, mapping)).toBe(reason);
   });
 
   it('使用官方平台编号；有主机提示的旧任务不默认成 PC', () => {
@@ -231,7 +226,7 @@ describe('前端格式化与输入校验', () => {
     const mapped: GameMapping = { gameId: 7, gameName: '测试游戏', areaName: '一区', seconds: 900 };
     const psTask = task({ platformId: 8 });
     expect(mappingDescription(task(), mapped)).toBe('PC · 测试游戏 · 一区 · 15 分钟');
-    expect(mappingDescription(psTask, { ...mapped, platformId: 8 })).toBe('PlayStation · 测试游戏 · 一区 · 15 分钟');
+    expect(mappingDescription(psTask, { ...mapped, areaName: undefined, platformId: 8 })).toBe('PlayStation · 测试游戏 · 上次 / 默认区服 · 15 分钟');
     for (const stale of [mapped, { ...mapped, platformId: 6 }, { ...mapped, platformId: 9 }]) {
       const description = mappingDescription(psTask, stale);
       expect(description).toContain('PlayStation · 旧映射需重新匹配');
@@ -268,24 +263,23 @@ describe('桌面 IPC 契约', () => {
     desktop.isTauri.mockReset().mockReturnValue(true);
   });
 
-  it('状态读取只调用 get_state，搜索保留 action 与 payload 结构', async () => {
+  it('状态读取只调用 get_state，并返回后台快照', async () => {
     const snapshot = { version: '0.3.2', run: { status: 'idle' } };
-    desktop.invoke.mockResolvedValueOnce(snapshot).mockResolvedValueOnce([]);
+    desktop.invoke.mockResolvedValueOnce(snapshot);
     expect(await getState()).toEqual(snapshot);
-    expect(desktop.invoke).toHaveBeenNthCalledWith(1, 'get_state', undefined);
-    expect(await dispatch({ action: 'search', payload: { keyword: '测试游戏' } })).toEqual([]);
-    expect(desktop.invoke).toHaveBeenNthCalledWith(2, 'dispatch', { action: 'search', payload: { keyword: '测试游戏' } });
+    expect(desktop.invoke.mock.calls).toEqual([['get_state', undefined]]);
   });
 
-  it('PS 与 Xbox 搜索转发平台，保存映射仍只发送选定游戏、区服与时长', async () => {
-    desktop.invoke.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce(undefined);
-    await dispatch({ action: 'search', payload: { keyword: 'GTA6', platformId: 8 } });
-    await dispatch({ action: 'search', payload: { keyword: 'GTA6', platformId: 9 } });
+  it('搜索转发可选平台并返回结果，保存映射保留区服与时长', async () => {
+    const results = [{ id: 20, name: 'GTA6', english: 'GTA6', platformId: 8 }];
+    desktop.invoke.mockResolvedValueOnce([]).mockResolvedValueOnce(results).mockResolvedValueOnce(undefined);
+    expect(await dispatch({ action: 'search', payload: { keyword: 'GTA6' } })).toEqual([]);
+    expect(await dispatch({ action: 'search', payload: { keyword: 'GTA6', platformId: 8 } })).toEqual(results);
     const payload = { key: 'activity-1:001', gameId: 20, areaId: null, seconds: 600 };
     await dispatch({ action: 'mapping', payload });
     expect(desktop.invoke.mock.calls).toEqual([
+      ['dispatch', { action: 'search', payload: { keyword: 'GTA6' } }],
       ['dispatch', { action: 'search', payload: { keyword: 'GTA6', platformId: 8 } }],
-      ['dispatch', { action: 'search', payload: { keyword: 'GTA6', platformId: 9 } }],
       ['dispatch', { action: 'mapping', payload }],
     ]);
   });

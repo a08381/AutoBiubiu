@@ -25,7 +25,7 @@ pub fn normalize(raw: &Value, checked_at: i64) -> Value {
     json!({"expiresAt":expires_at,"kind":kind,"checkedAt":checked_at})
 }
 
-fn milliseconds(value: &Value) -> Option<i64> {
+pub(crate) fn milliseconds(value: &Value) -> Option<i64> {
     let value = value
         .as_i64()
         .or_else(|| value.as_str()?.trim().parse::<i64>().ok())?;

@@ -1,12 +1,14 @@
 use crate::{
     backend::{ApiError, Backend},
     domain::{build_plan, day_key, now_ms, valid_interval},
+    entitlement::FreeAccess,
     lease::Lease,
     storage::Storage,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::{
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU16, Ordering},
         Arc, Mutex as StdMutex,
@@ -19,12 +21,20 @@ use tokio::{
 };
 
 #[async_trait]
-pub trait Service: Send {
+pub(crate) trait Service: Send {
     fn snapshot(&self) -> Value;
     async fn action(&mut self, action: &str, payload: &Value) -> Result<Value, String>;
     async fn connect_session(&mut self, id: &str) -> Result<(), String>;
     async fn refresh(&mut self, id: &str) -> Result<Value, String>;
     async fn status(&mut self) -> Result<Value, String>;
+    async fn refresh_membership(&mut self) -> Result<Value, String>;
+    async fn free_catalog(&mut self) -> Result<HashSet<i64>, String>;
+    async fn free_access(
+        &mut self,
+        id: i64,
+        platform: i64,
+        in_free_catalog: bool,
+    ) -> Result<FreeAccess, String>;
     async fn start_game(
         &mut self,
         id: i64,
@@ -87,6 +97,20 @@ impl Service for Backend {
     async fn status(&mut self) -> Result<Value, String> {
         Backend::status(self).await
     }
+    async fn refresh_membership(&mut self) -> Result<Value, String> {
+        Backend::refresh_membership(self).await
+    }
+    async fn free_catalog(&mut self) -> Result<HashSet<i64>, String> {
+        Backend::free_catalog(self).await
+    }
+    async fn free_access(
+        &mut self,
+        id: i64,
+        platform: i64,
+        in_free_catalog: bool,
+    ) -> Result<FreeAccess, String> {
+        Backend::free_access(self, id, platform, in_free_catalog).await
+    }
     async fn start_game(
         &mut self,
         id: i64,
@@ -124,6 +148,21 @@ pub struct Engine {
     port: AtomicU16,
     tick: Duration,
     buffer: f64,
+}
+
+#[derive(Clone, Copy)]
+enum QueueAccess {
+    Member(i64),
+    Free(FreeAccess),
+}
+
+impl QueueAccess {
+    fn kind(self, now: i64) -> Option<&'static str> {
+        match self {
+            Self::Member(expires_at) => (expires_at > now).then_some("member"),
+            Self::Free(access) => access.kind(now),
+        }
+    }
 }
 
 struct Operation<'a>(&'a StdMutex<Option<String>>);
@@ -459,29 +498,180 @@ impl Engine {
         .await?;
         self.log(format!("开始执行 {} 组游戏任务", groups.len()), "info")
             .await?;
+        // 已经可以领取的任务和现有抽奖次数不需要加速，也可能发放会员时长。
+        let mut pending = Vec::new();
         for group in groups {
-            self.execute_group(group).await?;
+            let tasks = self.prepare_group(group).await?;
+            if !tasks.is_empty() {
+                let mut group = group.clone();
+                group["tasks"] = json!(tasks);
+                pending.push(group);
+            }
         }
         for id in ids {
             self.assert_running().await?;
             self.draw_tickets(id, None).await?;
         }
+        self.execute_pending(&mut pending).await?;
         self.assert_running().await?;
+        let message = if pending.is_empty() {
+            "本轮执行结束，请查看任务与奖品记录".to_owned()
+        } else {
+            format!(
+                "本轮执行结束：未确认有效会员时长，{} 组未确认免费可用的任务暂未执行",
+                pending.len()
+            )
+        };
         self.change(|r| {
             r["status"] = json!("completed");
             r["group"] = Value::Null;
-            r["message"] = json!("本轮执行结束，请查看任务与奖品记录");
+            r["message"] = json!(message);
         })
         .await?;
-        self.log("本轮执行结束，请查看任务与奖品记录", "info").await
+        self.log(message, if pending.is_empty() { "info" } else { "warn" })
+            .await
     }
-    async fn execute_group(&self, group: &Value) -> Result<(), String> {
+
+    async fn queue_membership(&self) -> Result<Option<i64>, String> {
         self.assert_running().await?;
-        self.change(|r| {
-            r["group"] = group.clone();
-            r["elapsed"] = json!(0);
-        })
-        .await?;
+        let result = {
+            let mut service = self.service.lock().await;
+            let result = service.refresh_membership().await;
+            self.publish(service.as_ref());
+            result
+        };
+        self.assert_running().await?;
+        match result {
+            Ok(snapshot) => Ok(snapshot["expiresAt"].as_i64().filter(|end| *end > now_ms())),
+            Err(error) => {
+                self.log(
+                    format!("会员状态刷新失败，未确认有效会员时长：{error}"),
+                    "warn",
+                )
+                .await?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn execute_pending(&self, pending: &mut Vec<Value>) -> Result<(), String> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut membership = self.queue_membership().await?;
+        let mut catalog = None;
+        let mut access_by_game = HashMap::new();
+        while !pending.is_empty() {
+            self.assert_running().await?;
+            if membership.is_some_and(|end| end <= now_ms()) {
+                // 上一组可能已获得时长；旧的到期时间不能用来判断续期结果。
+                membership = self.queue_membership().await?;
+            }
+            let choice = if let Some(end) = membership.filter(|end| *end > now_ms()) {
+                Some((0, QueueAccess::Member(end)))
+            } else {
+                let catalog = match &catalog {
+                    Some(ids) => ids,
+                    None => {
+                        let result = self.service.lock().await.free_catalog().await;
+                        let ids = match result {
+                            Ok(ids) => ids,
+                            Err(error) => {
+                                self.log(
+                                    format!(
+                                        "免费游戏库读取失败，仅尝试有明确限免时段的游戏：{error}"
+                                    ),
+                                    "warn",
+                                )
+                                .await?;
+                                HashSet::new()
+                            }
+                        };
+                        catalog.insert(ids)
+                    }
+                };
+                for group in pending.iter() {
+                    self.assert_running().await?;
+                    let (id, platform) = group_game(group)?;
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        access_by_game.entry((id, platform))
+                    {
+                        let result = self
+                            .service
+                            .lock()
+                            .await
+                            .free_access(id, platform, catalog.contains(&id))
+                            .await;
+                        let access = match result {
+                            Ok(access) => access,
+                            Err(error) => {
+                                self.log(
+                                    format!(
+                                        "无法确认 {} 的免费资格：{error}",
+                                        group["gameName"].as_str().unwrap_or("游戏")
+                                    ),
+                                    "warn",
+                                )
+                                .await?;
+                                FreeAccess::Unconfirmed
+                            }
+                        };
+                        entry.insert(access);
+                    }
+                }
+                let now = now_ms();
+                let mut free = None;
+                let mut limited = None;
+                for (index, group) in pending.iter().enumerate() {
+                    let access = access_by_game[&group_game(group)?];
+                    match access.kind(now) {
+                        Some("limited-free") => {
+                            limited = Some((index, QueueAccess::Free(access)));
+                            break;
+                        }
+                        Some("free-catalog") if free.is_none() => {
+                            free = Some((index, QueueAccess::Free(access)))
+                        }
+                        _ => {}
+                    }
+                }
+                limited.or(free)
+            };
+            let Some((index, access)) = choice else { break };
+            let group = &pending[index];
+            let tasks = self.prepare_group(group).await?;
+            if !tasks.is_empty() {
+                let Some(kind) = access.kind(now_ms()) else {
+                    // 刷新任务状态期间权益可能已经到期，重新排队而不是强行启动。
+                    pending[index]["tasks"] = json!(tasks);
+                    continue;
+                };
+                self.execute_group(group, tasks, kind).await?;
+            }
+            pending.remove(index);
+            if matches!(access, QueueAccess::Free(_)) && !pending.is_empty() {
+                let renewed = self.queue_membership().await?;
+                if renewed.is_some() {
+                    self.log("已确认账号有新的有效会员时长，继续执行剩余任务", "info")
+                        .await?;
+                }
+                membership = renewed;
+            }
+        }
+        for group in pending {
+            self.log(
+                format!(
+                    "{} 暂未执行：无已确认有效的会员时长或免费资格",
+                    group["gameName"].as_str().unwrap_or("游戏")
+                ),
+                "warn",
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn prepare_group(&self, group: &Value) -> Result<Vec<Value>, String> {
         let mut pending = Vec::new();
         for task in group["tasks"].as_array().ok_or("任务组格式无效")? {
             self.assert_running().await?;
@@ -517,13 +707,27 @@ impl Engine {
                 }
             }
         }
-        if pending.is_empty() {
-            return Ok(());
-        }
+        Ok(pending)
+    }
+
+    async fn execute_group(
+        &self,
+        group: &Value,
+        pending: Vec<Value>,
+        kind: &str,
+    ) -> Result<(), String> {
         self.assert_running().await?;
-        let id = group["gameId"].as_i64().ok_or("游戏编号无效")?;
-        self.change(|r| r["ownedGameId"] = json!(id)).await?;
-        let result = self.accelerate(group, pending).await;
+        let (id, _) = group_game(group)?;
+        self.change(|r| {
+            let mut active = group.clone();
+            active["tasks"] = json!(pending);
+            active["access"] = json!(kind);
+            r["group"] = active;
+            r["elapsed"] = json!(0);
+            r["ownedGameId"] = json!(id);
+        })
+        .await?;
+        let result = self.accelerate(group, pending, kind).await;
         // 无论开始、领取还是计时失败，都仅清理本工具记录的游戏。
         self.stop_owned().await?;
         if let Err(error) = result {
@@ -541,15 +745,22 @@ impl Engine {
         }
         Ok(())
     }
-    async fn accelerate(&self, group: &Value, mut pending: Vec<Value>) -> Result<(), String> {
+    async fn accelerate(
+        &self,
+        group: &Value,
+        mut pending: Vec<Value>,
+        kind: &str,
+    ) -> Result<(), String> {
         self.assert_running().await?;
-        let id = group["gameId"].as_i64().ok_or("游戏编号无效")?;
-        let platform = group["platformId"]
-            .as_i64()
-            .unwrap_or(crate::domain::PC_PLATFORM);
+        let (id, platform) = group_game(group)?;
+        let category = match kind {
+            "limited-free" => "限免时段",
+            "free-catalog" => "免费目录",
+            _ => "会员有效",
+        };
         self.log(
             format!(
-                "开始加速 {}（{}）",
+                "开始加速 {}（{} · {category}）",
                 group["gameName"].as_str().unwrap_or("游戏"),
                 crate::domain::platform_name(platform)
             ),
@@ -797,6 +1008,14 @@ fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("参数 {key} 无效"))
 }
+fn group_game(group: &Value) -> Result<(i64, i64), String> {
+    let id = group["gameId"].as_i64().ok_or("游戏编号无效")?;
+    let platform = group["platformId"]
+        .as_i64()
+        .unwrap_or(crate::domain::PC_PLATFORM);
+    Ok((id, platform))
+}
+
 fn tickets(activity: &Value) -> Result<u64, String> {
     activity["tickets"]
         .as_f64()
@@ -951,6 +1170,10 @@ mod tests {
     struct Fixture {
         activity: Value,
         mappings: Value,
+        membership: Value,
+        renew_on_draw: Option<i64>,
+        catalog: HashSet<i64>,
+        free_access: HashMap<i64, FreeAccess>,
         events: Vec<String>,
         starts: Vec<(i64, Option<i64>, i64)>,
         claims: Vec<(String, Value)>,
@@ -983,6 +1206,10 @@ mod tests {
                         {"id":1,"type":7,"status":status,"title":"测试任务","supported":true,"seconds":1,"finishCount":0}
                     ]}),
                     mappings: json!({"a:1":{"gameId":42,"gameName":"测试游戏"}}),
+                    membership: json!({"expiresAt":now_ms() + 86_400_000}),
+                    renew_on_draw: None,
+                    catalog: HashSet::new(),
+                    free_access: HashMap::new(),
                     events: Vec::new(),
                     starts: Vec::new(),
                     claims: Vec::new(),
@@ -1015,7 +1242,7 @@ mod tests {
     impl Service for MockService {
         fn snapshot(&self) -> Value {
             let data = self.0.data.lock().unwrap();
-            json!({"activities":[data.activity],"mappings":data.mappings,
+            json!({"activities":[data.activity],"mappings":data.mappings,"membership":data.membership,
                 "authenticated":data.authenticated,"connection":{"connected":data.authenticated,"loggedIn":data.authenticated}})
         }
         async fn action(&mut self, _action: &str, _payload: &Value) -> Result<Value, String> {
@@ -1056,6 +1283,31 @@ mod tests {
             let mut status = data.acceleration.clone();
             status["active"] = json!(data.active);
             Ok(status)
+        }
+        async fn refresh_membership(&mut self) -> Result<Value, String> {
+            let mut data = self.0.data.lock().unwrap();
+            data.events.push("membership".to_owned());
+            Ok(data.membership.clone())
+        }
+        async fn free_catalog(&mut self) -> Result<HashSet<i64>, String> {
+            Ok(self.0.data.lock().unwrap().catalog.clone())
+        }
+        async fn free_access(
+            &mut self,
+            id: i64,
+            _platform: i64,
+            in_free_catalog: bool,
+        ) -> Result<FreeAccess, String> {
+            let data = self.0.data.lock().unwrap();
+            Ok(data
+                .free_access
+                .get(&id)
+                .copied()
+                .unwrap_or(if in_free_catalog {
+                    FreeAccess::Catalog
+                } else {
+                    FreeAccess::Unconfirmed
+                }))
         }
         async fn start_game(
             &mut self,
@@ -1120,6 +1372,9 @@ mod tests {
             }
             if !data.unchanged_tickets {
                 data.activity["tickets"] = json!(0);
+                if let Some(end) = data.renew_on_draw.take() {
+                    data.membership["expiresAt"] = json!(end);
+                }
             }
             // 不返回 inventoryDetailId，测试不需要等待奖品详情延迟。
             Ok(json!({"rightsName":"测试奖品"}))
@@ -1146,6 +1401,106 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_membership_prioritizes_free_games_and_resumes_only_after_verified_renewal() {
+        for renewal in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mock = Mock::new(1, 0);
+            let now = now_ms();
+            {
+                let mut data = mock.data.lock().unwrap();
+                data.membership = json!({"expiresAt":now - 10_000});
+                data.renew_on_draw = renewal.then_some(now + 86_400_000);
+                data.activity["tasks"] = json!([
+                    {"id":1,"type":7,"status":1,"title":"会员任务","supported":true,"seconds":1},
+                    {"id":2,"type":7,"status":1,"title":"免费目录任务","supported":true,"seconds":1},
+                    {"id":3,"type":7,"status":1,"title":"限免任务","supported":true,"seconds":1},
+                    {"id":4,"type":7,"status":1,"title":"限免已过期任务","supported":true,"seconds":1}
+                ]);
+                data.mappings = json!({
+                    "a:1":{"gameId":41,"gameName":"会员游戏"},
+                    "a:2":{"gameId":42,"gameName":"目录游戏"},
+                    "a:3":{"gameId":43,"gameName":"限免游戏"},
+                    "a:4":{"gameId":44,"gameName":"限免已过期游戏"}
+                });
+                data.catalog.extend([42, 44]);
+                data.free_access.insert(
+                    43,
+                    FreeAccess::Limited {
+                        start: now - 10_000,
+                        end: now + 60_000,
+                    },
+                );
+                data.free_access.insert(
+                    44,
+                    FreeAccess::Limited {
+                        start: now - 10_000,
+                        end: now - 1,
+                    },
+                );
+            }
+            let mut engine = fixture(&mock, Storage::new(root.path().to_owned()).unwrap()).await;
+            let test_engine = Arc::get_mut(&mut engine).unwrap();
+            test_engine.tick = Duration::from_millis(10);
+            test_engine.buffer = 0.0;
+            tokio::time::timeout(Duration::from_secs(10), engine.run_worker(vec!["a".into()]))
+                .await
+                .unwrap();
+            let snapshot = engine.snapshot().await;
+            let run = &snapshot["run"];
+            assert_eq!(run["status"], "completed", "{run}");
+            let data = mock.data.lock().unwrap();
+            let started: Vec<_> = data.starts.iter().map(|(id, _, _)| *id).collect();
+            if renewal {
+                assert_eq!(started, vec![43, 41, 42, 44]);
+                assert_eq!(snapshot["membership"]["expiresAt"], now + 86_400_000);
+                assert!(run["logs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("新的有效会员时长")));
+            } else {
+                assert_eq!(started, vec![43, 42]);
+                assert!(run["message"].as_str().unwrap().contains("2 组"));
+            }
+            let lottery = data
+                .events
+                .iter()
+                .position(|event| event == "draw")
+                .unwrap();
+            let membership = data
+                .events
+                .iter()
+                .rposition(|event| event == "membership")
+                .unwrap();
+            assert!(lottery < membership);
+        }
+    }
+
+    #[tokio::test]
+    async fn available_lottery_can_renew_membership_before_any_game_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let mock = Mock::new(1, 1);
+        {
+            let mut data = mock.data.lock().unwrap();
+            data.membership = json!({"expiresAt":null});
+            data.renew_on_draw = Some(now_ms() + 86_400_000);
+        }
+        let mut engine = fixture(&mock, Storage::new(root.path().to_owned()).unwrap()).await;
+        let test_engine = Arc::get_mut(&mut engine).unwrap();
+        test_engine.tick = Duration::from_millis(10);
+        test_engine.buffer = 0.0;
+        execute(&engine).await;
+        let events = mock.events();
+        let first = |event| events.iter().position(|item| item == event).unwrap();
+        assert!(first("draw") < first("membership"));
+        assert!(first("membership") < first("start"));
+        assert_eq!(engine.snapshot().await["run"]["status"], "completed");
     }
 
     fn warframe_mock(pc_status: i64, mobile_status: i64) -> Arc<Mock> {
@@ -1348,7 +1703,7 @@ mod tests {
                     "seconds":2,"status":status,"manual":true});
                 let group =
                     json!({"gameId":42,"gameName":"Warframe","platformId":6,"tasks":[task]});
-                engine.execute_group(&group).await.unwrap();
+                assert!(engine.prepare_group(&group).await.unwrap().is_empty());
                 assert_eq!(
                     engine.collect(&task).await.unwrap_err(),
                     "这是手机端加速任务，PC 客户端不计入"

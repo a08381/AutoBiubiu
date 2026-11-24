@@ -1,4 +1,5 @@
 use crate::domain::{self, ORIGIN, ROUTE};
+use crate::entitlement::FreeAccess;
 use crate::storage::Storage;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{
@@ -642,6 +643,22 @@ impl Backend {
             })
             .cloned()
             .collect())
+    }
+
+    pub(crate) async fn free_catalog(&mut self) -> Result<HashSet<i64>, String> {
+        let response = self.ipc("get-free-game-library", json!({})).await?;
+        free_catalog_ids(&response)
+    }
+
+    pub(crate) async fn free_access(
+        &mut self,
+        game_id: i64,
+        platform: i64,
+        in_free_catalog: bool,
+    ) -> Result<FreeAccess, String> {
+        let game = self.game(game_id).await?;
+        validate_game_platform(&game, platform)?;
+        Ok(FreeAccess::from_game(&game["gameInfo"], in_free_catalog))
     }
 
     async fn game(&mut self, game_id: i64) -> Result<Value, String> {
@@ -1430,6 +1447,17 @@ fn validate_game_platform(game: &Value, platform: i64) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn free_catalog_ids(response: &Value) -> Result<HashSet<i64>, String> {
+    let sections = response["data"]["data"]
+        .as_array()
+        .ok_or("免费游戏库格式无效")?;
+    Ok(sections
+        .iter()
+        .flat_map(|section| section["gameList"].as_array().into_iter().flatten())
+        .filter_map(|entry| positive_integer(&entry["gameInfo"]["gameId"]))
+        .collect())
 }
 
 fn ui_game(game: &Value) -> Value {

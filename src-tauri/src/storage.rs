@@ -423,17 +423,25 @@ mod tests {
         let legacy = root.path().join("legacy");
         let target = root.path().join("profile/data");
         fs::create_dir(&legacy).unwrap();
-        fs::write(legacy.join("run.json"), r#"{"pending":{"kind":"draw"}}"#).unwrap();
-        fs::write(legacy.join("events.jsonl"), "{\"message\":\"test\"}\n").unwrap();
+        let records = [
+            ("run.json", r#"{"pending":{"kind":"draw"}}"#),
+            ("events.jsonl", "{\"message\":\"test\"}\n"),
+            (
+                "settings.json",
+                r#"{"executablePath":"C:/x/biubiu.exe","debugPort":9222}"#,
+            ),
+        ];
+        for (name, contents) in records {
+            fs::write(legacy.join(name), contents).unwrap();
+        }
         fs::write(legacy.join("research.txt"), "keep").unwrap();
-        // Port zero is a private fixture namespace, never the user's real debug port.
+        // 使用独立夹具端口，不争用真实客户端的运行锁。
         prepare_data_directory(&target, Some(&legacy), 64990)
             .await
             .unwrap();
-        assert_eq!(
-            fs::read(target.join("run.json")).unwrap(),
-            fs::read(legacy.join("run.json")).unwrap()
-        );
+        for (name, contents) in records {
+            assert_eq!(fs::read_to_string(target.join(name)).unwrap(), contents);
+        }
         assert!(!target.join("research.txt").exists());
         assert!(legacy.join("research.txt").exists());
         fs::write(target.join("run.json"), "{\"new\":true}").unwrap();
@@ -454,29 +462,5 @@ mod tests {
         assert!(check_legacy_lock(&lock).is_err());
         fs::write(&lock, b"corrupt").unwrap();
         assert!(check_legacy_lock(&lock).is_err());
-    }
-
-    #[tokio::test]
-    async fn migration_copies_appdata_settings_into_running_directory() {
-        let root = tempfile::tempdir().unwrap();
-        let legacy = root.path().join("appdata");
-        let target = root.path().join("portable").join("data");
-        fs::create_dir(&legacy).unwrap();
-        fs::write(
-            legacy.join("settings.json"),
-            r#"{"executablePath":"C:/x/biubiu.exe","debugPort":9222}"#,
-        )
-        .unwrap();
-        fs::write(legacy.join("run.json"), r#"{"status":"idle"}"#).unwrap();
-        // 每个迁移测试使用不同的夹具端口，避免并行时争用同一把运行锁。
-        prepare_data_directory(&target, Some(&legacy), 64995)
-            .await
-            .unwrap();
-        assert!(target.join("settings.json").is_file());
-        assert_eq!(
-            fs::read_to_string(target.join("settings.json")).unwrap(),
-            r#"{"executablePath":"C:/x/biubiu.exe","debugPort":9222}"#
-        );
-        assert!(target.join("run.json").is_file());
     }
 }
