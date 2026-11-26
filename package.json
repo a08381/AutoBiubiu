@@ -1,6 +1,6 @@
 {
   "name": "autobiubiu",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "license": "MIT",
   "description": "基于 Tauri、Rust 和 Svelte 的 Windows 本地 biubiu 活动助手",
   "private": true,

@@ -457,7 +457,7 @@
       <div class="rail-spacer"></div>
       <button type="button" class:current={page === 'settings'} aria-current={page === 'settings' ? 'page' : undefined}
         title="设置" onclick={() => { page = 'settings'; }}><Icon name="settings" size={22} /><span>设置</span></button>
-      <span class="rail-version">v{snapshot?.version || '0.3.3'}</span>
+      <span class="rail-version">v{snapshot?.version || '0.3.4'}</span>
     </nav>
 
     <main class="workspace">
@@ -636,7 +636,7 @@
           </div>
           <div class="setting-row"><span class="setting-icon"><Icon name="clock" size={21} /></span><div class="setting-copy"><h3>计时与任务规则</h3><p>同平台、同游戏、同区服合并计时。手机端、邀请和游戏内任务需手动完成。</p></div></div>
           <div class="setting-row"><span class="setting-icon"><Icon name="power" size={21} /></span><div class="setting-copy"><h3>退出应用</h3><p>由桌面后台确认退出、停止加速并保存记录。</p></div><button type="button" class="secondary" disabled={utilityBusy !== null} onclick={() => utility('exit')}>{utilityBusy === 'exit' ? '正在退出…' : '退出应用'}</button></div>
-          <div class="about-app"><span class="app-symbol"><Icon name="arrow" size={20} /></span><strong>AutoBiubiu</strong><span>版本 {snapshot?.version || '0.3.3'} · 本地活动助手</span><p>让等待有个好结果。</p></div>
+          <div class="about-app"><span class="app-symbol"><Icon name="arrow" size={20} /></span><strong>AutoBiubiu</strong><span>版本 {snapshot?.version || '0.3.4'} · 本地活动助手</span><p>让等待有个好结果。</p></div>
         </section>
       {/if}
     </main>
