@@ -243,7 +243,7 @@ impl Engine {
         *run = next;
         Ok(())
     }
-    async fn log(&self, message: impl Into<String>, level: &str) -> Result<(), String> {
+    pub(crate) async fn log(&self, message: impl Into<String>, level: &str) -> Result<(), String> {
         let event = json!({"time":now_ms(),"level":level,"message":message.into()});
         let mut run = self.run.lock().await;
         let logs = run["logs"].as_array_mut().ok_or("运行日志格式无效")?;

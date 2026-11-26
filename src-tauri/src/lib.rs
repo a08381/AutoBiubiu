@@ -48,7 +48,23 @@ async fn check_update(state: State<'_, Desktop>) -> Result<Option<updates::Relea
             latest_version: "9999.0.0".to_owned(),
         }));
     }
-    state.updates.check().await
+    let (result, checked) = state.updates.check().await;
+    if checked {
+        let (message, level) = match &result {
+            Ok(Some(update)) => (format!("发现新版本 {}", update.latest_version), "info"),
+            Ok(None) => ("没有更新的正式版本".to_owned(), "info"),
+            Err(error) => (format!("检查失败：{error}"), "warn"),
+        };
+        let version = env!("CARGO_PKG_VERSION");
+        if let Err(error) = state
+            .engine
+            .log(format!("应用更新（当前版本 {version}）：{message}"), level)
+            .await
+        {
+            eprintln!("写入更新检查日志失败：{error}");
+        }
+    }
+    result
 }
 
 #[tauri::command]

@@ -49,7 +49,7 @@ impl UpdateChecker {
         })
     }
 
-    pub async fn check(&self) -> Result<Option<ReleaseUpdate>, String> {
+    pub async fn check(&self) -> (Result<Option<ReleaseUpdate>, String>, bool) {
         // 更新请求独立于任务引擎；缓存也合并窗口重载产生的并发请求。
         let mut cache = self.cache.lock().await;
         if cache
@@ -57,13 +57,13 @@ impl UpdateChecker {
             .is_some_and(|at| at.elapsed() < CHECK_INTERVAL)
         {
             if let Some(result) = &cache.result {
-                return result.clone();
+                return (result.clone(), false);
             }
         }
         let result = self.fetch().await;
         cache.checked_at = Some(Instant::now());
         cache.result = Some(result.clone());
-        result
+        (result, true)
     }
 
     async fn fetch(&self) -> Result<Option<ReleaseUpdate>, String> {
@@ -75,7 +75,12 @@ impl UpdateChecker {
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
             .await
-            .map_err(|_| "暂时无法连接 GitHub 检查更新".to_owned())?;
+            .map_err(|error| {
+                if error.is_timeout() {
+                    return "GitHub 更新请求超时".to_owned();
+                }
+                "暂时无法连接 GitHub 检查更新".to_owned()
+            })?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -142,12 +147,14 @@ mod tests {
     #[ignore = "仅显式验证时访问 GitHub 公开 Release，不接入活动客户端"]
     async fn github_latest_release_live() {
         let checker = UpdateChecker::new().unwrap();
-        let result = checker.check().await.unwrap();
+        let (result, checked) = checker.check().await;
+        let result = result.unwrap();
+        assert!(checked);
         println!(
             "GitHub latest checked: current={}, update={result:?}",
             env!("CARGO_PKG_VERSION")
         );
-        assert_eq!(checker.check().await.unwrap(), result);
+        assert_eq!(checker.check().await, (Ok(result), false));
     }
 
     #[test]

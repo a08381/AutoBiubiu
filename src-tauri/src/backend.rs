@@ -1053,6 +1053,7 @@ impl Cdp {
 fn http_client(duration: Duration) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .no_proxy()
+        .tls_built_in_native_certs(false)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5).min(duration))
         .timeout(duration)

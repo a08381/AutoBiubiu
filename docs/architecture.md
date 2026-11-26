@@ -49,8 +49,8 @@ flowchart LR
 
 ## 应用更新检测
 
-更新检测由 [updates.rs](../src-tauri/src/updates.rs) 使用独立 HTTP 客户端请求 `https://api.github.com/repos/a08381/AutoBiubiu/releases/latest`，不使用活动会话。请求最多等待 10 秒，响应限制 256 KiB；通过 `semver` 比较 `tag_name` 与编译时 `CARGO_PKG_VERSION`（兼容 `v` 前缀，正确区分 `0.3.10` 与 `0.3.9`），忽略构建元数据，排除草稿、预发布和不合法版本。
+更新检测由 [updates.rs](../src-tauri/src/updates.rs) 使用独立 HTTP 客户端请求 `https://api.github.com/repos/a08381/AutoBiubiu/releases/latest`，不使用活动会话。更新客户端同时信任内置公开根证书和 Windows 系统根证书，仍校验证书和主机名；活动客户端的证书信任范围不变。请求最多等待 10 秒，响应限制 256 KiB；通过 `semver` 比较 `tag_name` 与编译时 `CARGO_PKG_VERSION`（兼容 `v` 前缀，正确区分 `0.3.10` 与 `0.3.9`），忽略构建元数据，排除草稿、预发布和不合法版本。
 
-更新检查与任务引擎锁隔离，结果与错误均缓存一小时，缓存到期不会自动请求；离线、GitHub 限流或其他失败不影响本地状态轮询与任务执行。跳转命令不接受外部 URL 参数，始终打开本仓库的 `/releases/latest`。
+界面加载时检查更新，支持代理环境变量和 Windows 系统代理。结果与错误均缓存一小时，缓存到期不会自动请求；每次实际请求的结果会记入「执行日志」和 `data/events.jsonl`，命中缓存不重复记录。离线、GitHub 限流或其他失败不影响本地状态轮询与任务执行。跳转命令不接受外部 URL 参数，始终打开本仓库的 `/releases/latest`。
 
 有更高的正式版本时，[更新横幅](../src/lib/UpdateBanner.svelte)显示在标题下方，占用正常页面空间，支持浅色/深色主题和关闭，不遮挡任务操作。
