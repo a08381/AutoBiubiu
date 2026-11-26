@@ -16,6 +16,8 @@ pub struct Smoke {
     phase: AtomicUsize,
     second: AtomicBool,
     checks: Mutex<Value>,
+    shutdown_at: Mutex<Option<i64>>,
+    shutdown_cancel_attempted: AtomicBool,
 }
 
 impl Smoke {
@@ -43,6 +45,8 @@ impl Smoke {
             .map_err(|e| e.to_string())?;
         }
         Ok(Self {
+            shutdown_at: Mutex::new(dir.as_ref().map(|_| crate::domain::now_ms() + 30_000)),
+            shutdown_cancel_attempted: AtomicBool::new(false),
             dir,
             phase: AtomicUsize::new(0),
             second: AtomicBool::new(false),
@@ -63,6 +67,7 @@ impl Smoke {
         if !self.enabled() {
             return snapshot;
         }
+        snapshot["shutdownAt"] = json!(*self.shutdown_at.lock().unwrap());
         let names = [
             "周末游戏时光，加速领取限时好礼",
             "冬日联机计划，和好友一起出发",
@@ -115,6 +120,13 @@ impl Smoke {
             {"time":"2026-11-10T02:10:00Z","level":"info","message":"已读取本机活动缓存，等待开始任务。"}
         ]);
         snapshot
+    }
+    pub fn cancel_shutdown(&self) -> Result<Value, String> {
+        if !self.shutdown_cancel_attempted.swap(true, Ordering::SeqCst) {
+            return Err("冒烟测试：模拟取消关机失败".to_owned());
+        }
+        *self.shutdown_at.lock().unwrap() = None;
+        Ok(json!({"ok":true}))
     }
     pub fn ready(&self) -> Result<(), std::io::Error> {
         if let Some(dir) = &self.dir {
@@ -173,6 +185,7 @@ async fn inspect(app: &tauri::AppHandle, state: &Desktop, report: &Value) -> Res
         "membershipDisplay",
         "clientSettings",
         "updateBanner",
+        "shutdownBanner",
     ];
     if ui_checks.iter().any(|key| report[*key] != true) {
         return Err("冒烟报告缺少界面检查结果".into());
@@ -233,6 +246,11 @@ async fn inspect(app: &tauri::AppHandle, state: &Desktop, report: &Value) -> Res
         .clone();
     checks["reload"] = json!(true);
     checks["smallWindow"] = report["desktopLayout"].clone();
+    checks["shutdownBanner"] = report["shutdownBanner"].clone();
+    checks["shutdownCancellation"] = report["shutdownCancellation"].clone();
+    if checks["shutdownCancellation"] != true {
+        return Err("关机取消交互未通过".to_owned());
+    }
     finish(
         app,
         state,
@@ -267,6 +285,8 @@ mod tests {
 
     fn mode(dir: Option<PathBuf>) -> Smoke {
         Smoke {
+            shutdown_at: Mutex::new(dir.as_ref().map(|_| crate::domain::now_ms() + 30_000)),
+            shutdown_cancel_attempted: AtomicBool::new(false),
             dir,
             phase: AtomicUsize::new(0),
             second: AtomicBool::new(false),

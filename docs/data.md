@@ -9,6 +9,7 @@
 | 数据 | 持久化位置 |
 | --- | --- |
 | 客户端安装路径、调试端口 | `settings.json` |
+| 任务完成后自动关机、关闭窗口行为 | `app-settings.json` |
 | 活动缓存 | `activities.json` |
 | 游戏、区服与时长映射 | `mappings.json` |
 | 执行状态、奖品、待核对操作 | `run.json` |
@@ -29,7 +30,7 @@
 
 ## 旧数据迁移
 
-首次迁移只在目标目录不存在时复制上表五个文件，不删除来源、不覆盖已有目标。来源优先级为 `AUTOBIUBIU_LEGACY_DATA_DIR`、存在的 `%APPDATA%\AutoBiubiu\data`，最后为开发版源码根目录的旧数据或发行版 EXE 旁的历史数据。[启动脚本](../scripts/launch.ps1)会显式选择源码根目录旧数据；冒烟模式完全禁用迁移。
+首次迁移只在目标目录不存在时复制上表六个文件，不删除来源、不覆盖已有目标。来源优先级为 `AUTOBIUBIU_LEGACY_DATA_DIR`、存在的 `%APPDATA%\AutoBiubiu\data`，最后为开发版源码根目录的旧数据或发行版 EXE 旁的历史数据。[启动脚本](../scripts/launch.ps1)会显式选择源码根目录旧数据；冒烟模式完全禁用迁移。
 
 ## 升级
 

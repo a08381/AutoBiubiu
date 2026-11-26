@@ -73,7 +73,7 @@ npm run test:desktop
 node scripts\smoke-desktop.js C:\path\to\autobiubiu.exe
 ```
 
-[桌面冒烟测试](../scripts/smoke-desktop.js)使用显式 `--smoke-test` 隔离目录，检查真实 IPC、导航、主题、搜索、勾选、布局、设置保存、托盘、单实例和退出保存；只允许隔离配置保存，不连接 biubiu，也不执行加速、领取或抽奖。报告与截图写入新建的 `data\tauri-smoke-*\`，不会提交到仓库。
+[桌面冒烟测试](../scripts/smoke-desktop.js)使用显式 `--smoke-test` 隔离目录，检查真实 IPC、导航、主题、搜索、勾选、布局、设置保存、托盘、单实例和退出保存，同时验证关机横幅倒计时、跨页及刷新保留、取消失败提示与取消成功。关机状态与取消结果均为隔离夹具，不调用 `shutdown.exe`；不连接 biubiu，也不执行加速、领取或抽奖。报告与截图写入新建的 `data\tauri-smoke-*\`，不会提交到仓库。
 
 ### 辅助脚本测试
 
@@ -118,7 +118,7 @@ powershell.exe -NoProfile -File scripts\diagnose-client-start.ps1 -Executable sr
 | 连接失败或端口占用 | 检查日志页与 `events.jsonl`，核对调试端口、UAC 和客户端页面就绪状态 |
 | 任务计时不增长 | 核对实际客户端的游戏、区服和加速状态；程序仅累计已确认的加速区间 |
 | 领取/抽奖处于待核对 | 先在官方页面核对结果，再重新读取，避免重复操作 |
-| 关闭窗口后仍在运行 | 关闭按钮是收起到托盘，使用设置页或托盘菜单退出 |
+| 关闭窗口后仍在运行 | 默认收起到托盘；可在设置中改为直接退出，或使用设置页、托盘菜单退出 |
 
 ## 项目结构
 

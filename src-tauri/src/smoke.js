@@ -2,7 +2,7 @@
   const report = { rendered: false, ipc: false, importValidation: false, operationsBlocked: false,
     navigation: false, themeSwitch: false, activityFilter: false, activitySelection: false,
     activityDetails: false, windowControls: false, desktopLayout: false, membershipDisplay: false, clientSettings: false,
-    updateBanner: false };
+    updateBanner: false, shutdownBanner: false };
   const internals = window.__TAURI_INTERNALS__;
   const send = (extra = {}) => internals?.invoke('smoke_report', { report: { ...report, ...extra } }).catch((error) => console.error('smoke_report failed', error));
   const waitFor = async (check, timeout = 10000) => {
@@ -35,7 +35,18 @@
       return send({ error: `读取状态失败：${error?.message || error}` });
     }
 
-    const banner = await waitFor(() => document.querySelector('.update-banner'));
+    const shutdownBanner = await waitFor(() => document.querySelector('[aria-label="自动关机提示"]'));
+    const shutdownControls = !!shutdownBanner && [...shutdownBanner.querySelectorAll('button')]
+      .some((button) => button.textContent === '取消关机');
+    const previousShutdownAt = sessionStorage.getItem('smoke-shutdown-at');
+    const shutdownPreserved = previousShutdownAt === null || Number(previousShutdownAt) === state.shutdownAt;
+    sessionStorage.setItem('smoke-shutdown-at', String(state.shutdownAt));
+    const initialSeconds = Number(/将在 (\d+) 秒后关机/.exec(shutdownBanner?.textContent)?.[1]);
+    const countdown = initialSeconds > 0 && initialSeconds <= 30 && !!(await waitFor(() => {
+      const seconds = Number(/将在 (\d+) 秒后关机/.exec(shutdownBanner.textContent)?.[1]);
+      return seconds > 0 && seconds < initialSeconds;
+    }, 3000));
+    const banner = await waitFor(() => document.querySelector('[aria-label="应用更新提示"]'));
     const release = await internals.invoke('check_update');
     const bannerControls = !!banner && banner.textContent.includes(`v${release.latestVersion}`)
       && banner.textContent.includes(`v${release.currentVersion}`)
@@ -99,10 +110,15 @@
 
     click('.nav-rail button[title="我的奖励"]');
     const rewardsPage = await waitFor(() => document.querySelector('#page-title')?.textContent === '我的奖励');
+    const rewardsShutdown = document.querySelector('[aria-label="自动关机提示"]') === shutdownBanner;
     click('.nav-rail button[title="执行日志"]');
     const logsPage = await waitFor(() => document.querySelector('.records-content .log'));
+    const logsShutdown = document.querySelector('[aria-label="自动关机提示"]') === shutdownBanner;
     click('.nav-rail button[title="设置"]');
     const settingsPage = await waitFor(() => document.querySelector('.theme-options'));
+    const settingsShutdown = document.querySelector('[aria-label="自动关机提示"]') === shutdownBanner;
+    const navigatedState = await internals.invoke('get_state');
+    const shutdownNavigation = rewardsShutdown && logsShutdown && settingsShutdown && navigatedState.shutdownAt === state.shutdownAt;
     report.navigation = !!rewardsPage && !!logsPage && !!settingsPage;
     const pathInput = document.querySelector('#client-path');
     const portInput = document.querySelector('#client-port');
@@ -154,6 +170,8 @@
         const bounds = document.querySelector(selector)?.getBoundingClientRect();
         return bounds && bounds.width > 0 && bounds.height > 0 && bounds.right <= innerWidth + 1 && bounds.bottom <= innerHeight + 1;
       }) && document.querySelector('.start-button')?.disabled === !state.connection.connected;
+    // 双横幅占用高度时，最小窗口通过运行面板内滚动访问停止按钮。
+    document.querySelector('.stop-button').scrollIntoView({ block: 'nearest' });
     const bannerBounds = banner?.getBoundingClientRect();
     const headerBounds = document.querySelector('.page-header')?.getBoundingClientRect();
     const commandsBounds = document.querySelector('.command-bar')?.getBoundingClientRect();
@@ -163,7 +181,8 @@
       && bannerBounds.width > 0 && bannerBounds.height > 0 && bannerBounds.right <= innerWidth + 1
       && banner.scrollWidth <= banner.clientWidth + 1
       && bannerBounds.top >= headerBounds.bottom - 1 && commandsBounds.top >= bannerBounds.bottom - 1
-      && stopBounds.bottom <= executionBounds.bottom + 1;
+      && stopBounds.top >= executionBounds.top - 1 && stopBounds.bottom <= executionBounds.bottom + 1;
+    document.querySelector('.execution-pane').scrollTop = 0;
     // 第一轮保留横幅供真实窗口截图；最小尺寸的第二轮验证关闭交互。
     let dismissed = true;
     if (innerWidth <= 900) {
@@ -171,9 +190,25 @@
       [...banner.querySelectorAll('button')].find((button) => button.textContent.includes('查看更新')).click();
       const openHandled = await waitFor(() => banner.querySelector('[role="alert"]')?.textContent.includes('冒烟测试模式不打开系统浏览器'));
       click('[aria-label="暂时关闭更新提示"]');
-      dismissed = !!openHandled && !!(await waitFor(() => !document.querySelector('.update-banner')));
+      dismissed = !!openHandled && !!(await waitFor(() => !document.querySelector('[aria-label="应用更新提示"]')));
     }
     report.updateBanner = !!bannerControls && !!bannerLayout && !!dismissed;
+    const shutdownBounds = shutdownBanner?.getBoundingClientRect();
+    const shutdownLayout = shutdownBounds && shutdownBounds.width > 0 && shutdownBounds.height > 0
+      && shutdownBounds.right <= innerWidth + 1 && shutdownBanner.scrollWidth <= shutdownBanner.clientWidth + 1;
+    report.shutdownBanner = !!shutdownControls && !!countdown && shutdownPreserved && shutdownNavigation && !!shutdownLayout;
+    if (innerWidth <= 900) {
+      click('[aria-label="自动关机提示"] button');
+      const cancelFailed = await waitFor(() => shutdownBanner.querySelector('[role="alert"]')?.textContent.includes('模拟取消关机失败')
+        && !shutdownBanner.querySelector('button').disabled);
+      const failedState = await internals.invoke('get_state');
+      click('[aria-label="自动关机提示"] button');
+      const cancelled = await waitFor(() => !document.querySelector('[aria-label="自动关机提示"]'));
+      const cancelledState = await internals.invoke('get_state');
+      report.shutdownCancellation = !!cancelFailed && failedState.shutdownAt === state.shutdownAt && !!cancelled
+        && cancelledState.shutdownAt === null
+        && cancelledState.appSettings.shutdownAfterCompletion === state.appSettings.shutdownAfterCompletion;
+    }
     const failed = Object.entries(report).filter(([, passed]) => !passed).map(([key]) => key);
     if (failed.length) return send({ error: `界面检查未通过：${failed.join('、')}` });
     send();

@@ -1,5 +1,6 @@
 use crate::{
     backend::{ApiError, Backend},
+    client_settings::{AppSettings, CloseBehavior},
     domain::{build_plan, day_key, now_ms, valid_interval},
     entitlement::FreeAccess,
     lease::Lease,
@@ -136,6 +137,8 @@ impl Service for Backend {
 pub struct Engine {
     service: Mutex<Box<dyn Service>>,
     cached: StdMutex<Value>,
+    app_settings: StdMutex<AppSettings>,
+    shutdown_at: StdMutex<Option<i64>>,
     run: Mutex<Value>,
     gate: Mutex<()>,
     operation: StdMutex<Option<String>>,
@@ -180,8 +183,16 @@ impl Engine {
     ) -> Result<Arc<Self>, String> {
         let saved = storage.read("run.json", json!({})).await?;
         let run = restore_run(saved)?;
+        let app_settings = serde_json::from_value(
+            storage
+                .read("app-settings.json", json!(AppSettings::default()))
+                .await?,
+        )
+        .map_err(|_| "应用设置格式无效，请检查 data/app-settings.json".to_owned())?;
         Ok(Arc::new(Self {
             cached: StdMutex::new(service.snapshot()),
+            app_settings: StdMutex::new(app_settings),
+            shutdown_at: StdMutex::new(None),
             service: Mutex::new(service),
             run: Mutex::new(run),
             gate: Mutex::new(()),
@@ -206,11 +217,16 @@ impl Engine {
             None,
             now_ms(),
         );
+        value["appSettings"] = json!(*self.app_settings.lock().unwrap());
+        value["shutdownAt"] = json!(*self.shutdown_at.lock().unwrap());
         value["operation"] = json!(*self.operation.lock().unwrap());
         value["run"] = self.run.lock().await.clone();
         value["dataDir"] = json!(self.storage.dir().to_string_lossy());
         value["version"] = json!(env!("CARGO_PKG_VERSION"));
         value
+    }
+    pub fn close_behavior(&self) -> CloseBehavior {
+        self.app_settings.lock().unwrap().close_behavior
     }
     pub fn has_operation(&self) -> bool {
         self.operation.lock().unwrap().is_some()
@@ -262,6 +278,23 @@ impl Engine {
             .gate
             .try_lock()
             .map_err(|_| "正在处理请求，请稍候".to_owned())?;
+        if action == "app-settings" {
+            let settings: AppSettings =
+                serde_json::from_value(payload).map_err(|_| "应用设置格式无效".to_owned())?;
+            self.storage
+                .write("app-settings.json", &json!(settings))
+                .await?;
+            *self.app_settings.lock().unwrap() = settings;
+            return Ok(json!({"ok":true}));
+        }
+        if action == "cancel-shutdown" {
+            if self.shutdown_at.lock().unwrap().is_none() {
+                return Err("没有待取消的自动关机".to_owned());
+            }
+            shutdown_command(&["/a"]).await?;
+            *self.shutdown_at.lock().unwrap() = None;
+            return Ok(json!({"ok":true}));
+        }
         if self.busy.load(Ordering::SeqCst) {
             return Err("请先停止任务，再修改配置或刷新活动".to_owned());
         }
@@ -308,8 +341,47 @@ impl Engine {
                 self.busy.store(true, Ordering::SeqCst);
                 let engine = Arc::clone(self);
                 *self.worker.lock().await = Some(tokio::spawn(async move {
-                    engine.run_worker(ids).await;
+                    let completed = engine.run_worker(ids).await;
                     drop(lease);
+                    if completed
+                        && !engine.cancelled.load(Ordering::SeqCst)
+                        && !engine.closing.load(Ordering::SeqCst)
+                        && engine
+                            .app_settings
+                            .lock()
+                            .unwrap()
+                            .shutdown_after_completion
+                    {
+                        let result: Result<(), String> = async {
+                            engine
+                                .log("本轮执行结束，准备在 30 秒后自动关机", "info")
+                                .await?;
+                            if engine.cancelled.load(Ordering::SeqCst)
+                                || engine.closing.load(Ordering::SeqCst)
+                                || !engine
+                                    .app_settings
+                                    .lock()
+                                    .unwrap()
+                                    .shutdown_after_completion
+                            {
+                                return Ok(());
+                            }
+                            let shutdown_at = now_ms() + 30_000;
+                            shutdown_command(&["/s", "/t", "30"]).await?;
+                            *engine.shutdown_at.lock().unwrap() = Some(shutdown_at);
+                            Ok(())
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            let _ = engine
+                                .change(|r| {
+                                    r["status"] = json!("error");
+                                    r["message"] = json!(format!("自动关机失败：{error}"));
+                                })
+                                .await;
+                            let _ = engine.log(format!("自动关机失败：{error}"), "error").await;
+                        }
+                    }
                     engine.busy.store(false, Ordering::SeqCst);
                 }));
                 Ok(json!({"ok":true}))
@@ -434,8 +506,9 @@ impl Engine {
         self.publish(service.as_ref());
         result
     }
-    async fn run_worker(&self, ids: Vec<String>) {
+    async fn run_worker(&self, ids: Vec<String>) -> bool {
         let result = self.prepare_execute(&ids).await;
+        let completed = matches!(result, Ok(true));
         if let Err(error) = result {
             let status = if self.cancelled.load(Ordering::SeqCst) {
                 "stopped"
@@ -456,9 +529,11 @@ impl Engine {
             let mut run = self.run.lock().await;
             run["status"] = json!("error");
             run["message"] = json!(format!("停止或保存加速状态失败：{error}"));
+            return false;
         }
+        completed
     }
-    async fn prepare_execute(&self, ids: &[String]) -> Result<(), String> {
+    async fn prepare_execute(&self, ids: &[String]) -> Result<bool, String> {
         self.assert_running().await?;
         {
             let mut service = self.service.lock().await;
@@ -512,7 +587,7 @@ impl Engine {
             self.assert_running().await?;
             self.draw_tickets(id, None).await?;
         }
-        self.execute_pending(&mut pending).await?;
+        let completed = self.execute_pending(&mut pending).await?;
         self.assert_running().await?;
         let message = if pending.is_empty() {
             "本轮执行结束，请查看任务与奖品记录".to_owned()
@@ -529,7 +604,8 @@ impl Engine {
         })
         .await?;
         self.log(message, if pending.is_empty() { "info" } else { "warn" })
-            .await
+            .await?;
+        Ok(completed && pending.is_empty())
     }
 
     async fn queue_membership(&self) -> Result<Option<i64>, String> {
@@ -554,10 +630,11 @@ impl Engine {
         }
     }
 
-    async fn execute_pending(&self, pending: &mut Vec<Value>) -> Result<(), String> {
+    async fn execute_pending(&self, pending: &mut Vec<Value>) -> Result<bool, String> {
         if pending.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
+        let mut completed = true;
         let mut membership = self.queue_membership().await?;
         let mut catalog = None;
         let mut access_by_game = HashMap::new();
@@ -646,7 +723,7 @@ impl Engine {
                     pending[index]["tasks"] = json!(tasks);
                     continue;
                 };
-                self.execute_group(group, tasks, kind).await?;
+                completed &= self.execute_group(group, tasks, kind).await?;
             }
             pending.remove(index);
             if matches!(access, QueueAccess::Free(_)) && !pending.is_empty() {
@@ -668,7 +745,7 @@ impl Engine {
             )
             .await?;
         }
-        Ok(())
+        Ok(completed)
     }
 
     async fn prepare_group(&self, group: &Value) -> Result<Vec<Value>, String> {
@@ -715,7 +792,7 @@ impl Engine {
         group: &Value,
         pending: Vec<Value>,
         kind: &str,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         self.assert_running().await?;
         let (id, _) = group_game(group)?;
         self.change(|r| {
@@ -730,27 +807,32 @@ impl Engine {
         let result = self.accelerate(group, pending, kind).await;
         // 无论开始、领取还是计时失败，都仅清理本工具记录的游戏。
         self.stop_owned().await?;
-        if let Err(error) = result {
-            if !self.run.lock().await["pending"].is_null() || self.assert_running().await.is_err() {
-                return Err(error);
+        match result {
+            Ok(completed) => Ok(completed),
+            Err(error) => {
+                if !self.run.lock().await["pending"].is_null()
+                    || self.assert_running().await.is_err()
+                {
+                    return Err(error);
+                }
+                self.log(
+                    format!(
+                        "{} 已跳过：{error}",
+                        group["gameName"].as_str().unwrap_or("游戏")
+                    ),
+                    "warn",
+                )
+                .await?;
+                Ok(false)
             }
-            self.log(
-                format!(
-                    "{} 已跳过：{error}",
-                    group["gameName"].as_str().unwrap_or("游戏")
-                ),
-                "warn",
-            )
-            .await?;
         }
-        Ok(())
     }
     async fn accelerate(
         &self,
         group: &Value,
         mut pending: Vec<Value>,
         kind: &str,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         self.assert_running().await?;
         let (id, platform) = group_game(group)?;
         let category = match kind {
@@ -782,6 +864,7 @@ impl Engine {
         let mut wall = now_ms();
         let mut mono = Instant::now();
         let mut elapsed = 0.0;
+        let mut completed = true;
         while !pending.is_empty() {
             self.assert_running().await?;
             tokio::select! { _ = tokio::time::sleep(self.tick) => {}, _ = self.wake.notified() => {} }
@@ -815,6 +898,7 @@ impl Engine {
                     {
                         return Err(error);
                     }
+                    completed = false;
                     self.log(
                         format!(
                             "任务领取失败：{}；{error}",
@@ -827,7 +911,7 @@ impl Engine {
                 pending.remove(i);
             }
         }
-        Ok(())
+        Ok(completed)
     }
     async fn mutation(&self, kind: &str, ids: Value) -> Result<Value, String> {
         self.assert_running().await?;
@@ -1000,6 +1084,31 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+async fn shutdown_command(args: &[&str]) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var_os("SystemRoot").ok_or("无法定位 Windows 系统目录")?;
+        let output = tokio::process::Command::new(
+            std::path::PathBuf::from(system_root).join("System32/shutdown.exe"),
+        )
+        .args(args)
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .output()
+        .await
+        .map_err(|e| format!("调用 shutdown.exe 失败：{e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "shutdown.exe 返回 {}：{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    Err("自动关机仅支持 Windows".into())
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -1394,13 +1503,13 @@ mod tests {
             .unwrap();
         engine
     }
-    async fn execute(engine: &Engine) {
+    async fn execute(engine: &Engine) -> bool {
         tokio::time::timeout(
             Duration::from_secs(3),
             engine.run_worker(vec!["a".to_owned()]),
         )
         .await
-        .unwrap();
+        .unwrap()
     }
 
     #[tokio::test]
@@ -1445,9 +1554,11 @@ mod tests {
             let test_engine = Arc::get_mut(&mut engine).unwrap();
             test_engine.tick = Duration::from_millis(10);
             test_engine.buffer = 0.0;
-            tokio::time::timeout(Duration::from_secs(10), engine.run_worker(vec!["a".into()]))
-                .await
-                .unwrap();
+            let completed =
+                tokio::time::timeout(Duration::from_secs(10), engine.run_worker(vec!["a".into()]))
+                    .await
+                    .unwrap();
+            assert_eq!(completed, renewal);
             let snapshot = engine.snapshot().await;
             let run = &snapshot["run"];
             assert_eq!(run["status"], "completed", "{run}");
@@ -1840,6 +1951,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_settings_save_while_running_without_changing_client_state_and_reload() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = Storage::new(root.path().to_owned()).unwrap();
+        let mock = Mock::new(2, 0);
+        let engine = fixture(&mock, storage.clone()).await;
+        assert_eq!(engine.close_behavior(), CloseBehavior::Background);
+        assert_eq!(
+            engine.snapshot().await["appSettings"]["shutdownAfterCompletion"],
+            false
+        );
+        let client_settings = json!({"executablePath":"biubiu.exe","debugPort":9333});
+        storage
+            .write("settings.json", &client_settings)
+            .await
+            .unwrap();
+        engine.busy.store(true, Ordering::SeqCst);
+        let settings = json!({"shutdownAfterCompletion":true,"closeBehavior":"exit"});
+        engine
+            .dispatch("app-settings", settings.clone())
+            .await
+            .unwrap();
+        assert_eq!(engine.snapshot().await["appSettings"], settings);
+        assert_eq!(engine.close_behavior(), CloseBehavior::Exit);
+        assert!(mock.events().is_empty());
+        assert_eq!(
+            storage.read("settings.json", Value::Null).await.unwrap(),
+            client_settings
+        );
+        assert_eq!(
+            storage
+                .read("app-settings.json", Value::Null)
+                .await
+                .unwrap(),
+            settings
+        );
+        for invalid in [
+            json!({"shutdownAfterCompletion":"true","closeBehavior":"exit"}),
+            json!({"shutdownAfterCompletion":true,"closeBehavior":"unknown"}),
+        ] {
+            assert!(engine.dispatch("app-settings", invalid).await.is_err());
+            assert_eq!(engine.snapshot().await["appSettings"], settings);
+        }
+        let restored = Engine::new(Box::new(MockService(mock.clone())), storage, 0)
+            .await
+            .unwrap();
+        assert_eq!(restored.snapshot().await["appSettings"], settings);
+        assert_eq!(restored.close_behavior(), CloseBehavior::Exit);
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_does_not_report_successful_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let mock = Mock::new(2, 0);
+        mock.data.lock().unwrap().stop_failures = 1;
+        let engine = fixture(&mock, Storage::new(root.path().to_owned()).unwrap()).await;
+        engine
+            .change(|r| r["ownedGameId"] = json!(42))
+            .await
+            .unwrap();
+        assert!(!execute(&engine).await);
+        assert_eq!(engine.snapshot().await["run"]["status"], "error");
+        assert_eq!(engine.snapshot().await["run"]["ownedGameId"], 42);
+    }
+
+    #[tokio::test]
     async fn settings_save_updates_snapshot_storage_and_the_task_lease_port() {
         let root = tempfile::tempdir().unwrap();
         let exe = root.path().join("biubiu.exe");
@@ -1940,7 +2116,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mock = Mock::new(2, 0);
         let engine = fixture(&mock, Storage::new(root.path().to_owned()).unwrap()).await;
-        execute(&engine).await;
+        assert!(execute(&engine).await);
         let snapshot = engine.snapshot().await;
         assert_eq!(snapshot["authenticated"], true);
         assert_eq!(snapshot["run"]["status"], "completed");
@@ -1961,7 +2137,7 @@ mod tests {
             definitive: false,
         });
         let engine = fixture(&mock, storage.clone()).await;
-        execute(&engine).await;
+        assert!(!execute(&engine).await);
         assert_eq!(engine.snapshot().await["run"]["pending"]["kind"], "claim");
         assert_eq!(
             storage.read("run.json", Value::Null).await.unwrap()["pending"]["kind"],
@@ -2017,9 +2193,7 @@ mod tests {
         engine.busy.store(true, Ordering::SeqCst);
         let task = {
             let engine = engine.clone();
-            tokio::spawn(async move {
-                execute(&engine).await;
-            })
+            tokio::spawn(async move { execute(&engine).await })
         };
         tokio::time::timeout(Duration::from_secs(3), mock.claim_entered.notified())
             .await
@@ -2027,7 +2201,7 @@ mod tests {
         engine.stop().await.unwrap();
         assert!(!task.is_finished());
         mock.claim_release.notify_one();
-        task.await.unwrap();
+        assert!(!task.await.unwrap());
         assert_eq!(engine.snapshot().await["run"]["status"], "stopped");
         assert!(!mock.events().iter().any(|e| e == "draw"));
     }

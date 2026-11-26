@@ -67,9 +67,14 @@ async fn dispatch(
     action: String,
     payload: Value,
 ) -> Result<Value, String> {
-    // 冒烟模式仅允许在隔离目录保存客户端设置，业务操作均不接入真实客户端。
-    if state.smoke.enabled() && action != "client-settings" {
-        return Err("冒烟测试模式不执行客户端操作".to_owned());
+    // 冒烟模式仅保存隔离设置或操作合成关机状态，不调用客户端和系统关机命令。
+    if state.smoke.enabled() {
+        if action == "cancel-shutdown" {
+            return state.smoke.cancel_shutdown();
+        }
+        if !matches!(action.as_str(), "client-settings" | "app-settings") {
+            return Err("冒烟测试模式不执行客户端操作".to_owned());
+        }
     }
     state.engine.dispatch(&action, payload).await
 }
@@ -420,6 +425,16 @@ pub fn run() {
                     .is_some_and(|state| state.exit_allowed.load(Ordering::SeqCst));
                 if !allowed {
                     api.prevent_close();
+                    if window
+                        .app_handle()
+                        .state::<Desktop>()
+                        .engine
+                        .close_behavior()
+                        == client_settings::CloseBehavior::Exit
+                    {
+                        begin_exit(window.app_handle());
+                        return;
+                    }
                     let _ = window.hide();
                 }
             }

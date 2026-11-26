@@ -108,14 +108,16 @@ p { margin: 0; }
 .page-header { display: flex; align-items: center; justify-content: space-between; gap: 20px; min-height: 91px; flex-shrink: 0; }
 h1 { font-size: 24px; font-weight: 600; letter-spacing: -.6px; margin: 0 0 4px; line-height: 1.35; }
 .page-header p { color: var(--muted); font-size: 12px; }
-.update-banner { display: flex; align-items: center; flex-shrink: 0; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--accent-soft); color: var(--accent); }
-.update-banner > svg { flex-shrink: 0; }
-.update-copy { flex: 1; min-width: 180px; overflow-wrap: anywhere; }
-.update-copy strong { font-size: 12px; margin-right: 12px; }
-.update-copy > span { color: var(--muted); font-size: 11px; }
-.update-copy .error { margin-top: 4px; font-size: 11px; }
-.update-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; flex-shrink: 0; }
-.update-actions .secondary { white-space: nowrap; font-size: 12px; }
+.banner { display: flex; align-items: center; flex-shrink: 0; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--accent-soft); color: var(--accent); }
+.banner > svg { flex-shrink: 0; }
+.banner-copy { flex: 1; min-width: 180px; overflow-wrap: anywhere; }
+.banner-copy strong { font-size: 12px; margin-right: 12px; }
+.banner-copy > span { color: var(--muted); font-size: 11px; }
+.banner-copy .error { margin-top: 4px; font-size: 11px; }
+.banner-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; flex-shrink: 0; }
+.banner-actions .secondary { white-space: nowrap; font-size: 12px; }
+.shutdown-banner { border-color: var(--danger); background: var(--danger-bg); color: var(--danger); }
+.shutdown-banner .banner-copy > span { color: inherit; }
 .account-area { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; min-width: 0; }
 .membership-info { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px; color: var(--muted); font-size: 11px; line-height: 1.7; }
 .membership-expiry { font-weight: 600; color: var(--text); white-space: nowrap; }

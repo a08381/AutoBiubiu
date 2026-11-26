@@ -27,15 +27,17 @@ import ClientSettingsPanel from '../src/lib/ClientSettingsPanel.svelte';
 import UpdateBanner from '../src/lib/UpdateBanner.svelte';
 
 describe('更新横幅', () => {
-  it('仅在启动时检查一次更新，定时器只用于本机状态轮询', () => {
+  it('仅在启动时检查一次更新，定时器用于本机状态轮询与关机倒计时', () => {
     // Node 环境不执行 onMount，直接检查应用的生命周期调度。
     const source = readFileSync(new URL('../src/App.svelte', import.meta.url), 'utf8');
     const lifecycle = source.match(/onMount\(\(\) => \{([\s\S]*?)\n  \}\);/)?.[1] ?? '';
     expect(lifecycle.match(/refreshUpdate\(\)/g)).toHaveLength(1);
     expect(lifecycle).toContain('void refreshUpdate();');
-    expect(lifecycle.match(/window\.setInterval\(/g)).toHaveLength(1);
+    expect(lifecycle.match(/window\.setInterval\(/g)).toHaveLength(2);
     expect(lifecycle).toContain('const timer = window.setInterval(() => { void refreshState(); }, 2000);');
+    expect(lifecycle).toContain('const clock = window.setInterval(() => { now = Date.now(); }, 1000);');
     expect(lifecycle).toContain('window.clearInterval(timer);');
+    expect(lifecycle).toContain('window.clearInterval(clock);');
     expect(lifecycle).not.toContain('updateTimer');
   });
 
@@ -294,6 +296,13 @@ describe('桌面 IPC 契约', () => {
       ['detect_client_installations', undefined], ['pick_client_directory', undefined],
       ['dispatch', { action: 'client-settings', payload }],
     ]);
+  });
+
+  it('应用偏好通过独立设置动作保存', async () => {
+    desktop.invoke.mockResolvedValue({ ok: true });
+    const payload = { shutdownAfterCompletion: true, closeBehavior: 'exit' as const };
+    await dispatch({ action: 'app-settings', payload });
+    expect(desktop.invoke).toHaveBeenCalledWith('dispatch', { action: 'app-settings', payload });
   });
 
   it('会员刷新沿用现有受控操作通道', async () => {

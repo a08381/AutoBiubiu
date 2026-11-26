@@ -148,12 +148,19 @@ export interface ClientSettings {
   debugPort: number;
 }
 
+export interface AppSettings {
+  shutdownAfterCompletion: boolean;
+  closeBehavior: 'background' | 'exit';
+}
+
 export interface ClientInstallation {
   executablePath: string;
   source: string;
 }
 
 export interface Snapshot {
+  appSettings: AppSettings;
+  shutdownAt: number | null;
   clientSettings?: ClientSettings;
   connection: Connection;
   membership?: Membership;
@@ -174,8 +181,9 @@ export interface ReleaseUpdate {
 }
 
 export type DispatchRequest =
-  | { action: 'connect' | 'membership' | 'stop' | 'stop-owned'; payload: Record<string, never> }
+  | { action: 'connect' | 'membership' | 'stop' | 'stop-owned' | 'cancel-shutdown'; payload: Record<string, never> }
   | { action: 'client-settings'; payload: ClientSettings }
+  | { action: 'app-settings'; payload: AppSettings }
   | { action: 'scan'; payload: { publicOnly?: boolean } }
   | { action: 'import'; payload: { url: string } }
   | { action: 'search'; payload: { keyword: string; platformId?: PlatformId } }

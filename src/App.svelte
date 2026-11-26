@@ -14,7 +14,7 @@
     taskKey, taskPlatformId, TASK_PLATFORM_REFRESH, validateActivityUrl,
   } from './lib/format';
   import { PC_PLATFORM_ID, type Activity, type ActivityTask, type DispatchRequest, type MutationRequest,
-    type ReleaseUpdate, type RunStatus, type SearchGame, type Snapshot } from './lib/types';
+    type AppSettings, type ReleaseUpdate, type RunStatus, type SearchGame, type Snapshot } from './lib/types';
 
   type DialogName = 'mapping' | 'import' | 'reconcile';
   type UtilityAction = 'external' | 'directory' | 'exit';
@@ -33,6 +33,9 @@
   let stateError = $state('');
   let busyAction = $state<DispatchRequest['action'] | null>(null);
   let stopBusy = $state(false);
+  let cancellingShutdown = $state(false);
+  let shutdownError = $state('');
+  let now = $state(Date.now());
   let utilityBusy = $state<UtilityAction | null>(null);
   // 窗口重载和公开导入一律视为缓存。
   // 只有显式核对账号并读回最新状态后，才标记为已核对。
@@ -76,6 +79,7 @@
 
   const activities = $derived(snapshot?.activities ?? []);
   const run = $derived(snapshot?.run);
+  const shutdownSeconds = $derived(Math.max(0, Math.ceil(((snapshot?.shutdownAt ?? now) - now) / 1000)));
   const selected = $derived(new Set(selectedIds));
   const accountVerified = $derived(Boolean(snapshot?.authenticated) && !publicView);
   const connected = $derived(Boolean(snapshot?.connection.connected));
@@ -203,10 +207,12 @@
     void refreshState();
     void refreshUpdate();
     const timer = window.setInterval(() => { void refreshState(); }, 2000);
+    const clock = window.setInterval(() => { now = Date.now(); }, 1000);
     return () => {
       mounted = false;
       mappingEpoch += 1;
       window.clearInterval(timer);
+      window.clearInterval(clock);
       media.removeEventListener('change', onThemeChange);
     };
   });
@@ -237,6 +243,34 @@
       return false;
     } finally {
       if (mounted) busyAction = null;
+    }
+  }
+
+  async function saveAppSettings(settings: AppSettings): Promise<void> {
+    if (!mounted || !snapshot || stateError || busyAction || utilityBusy === 'exit') return;
+    busyAction = 'app-settings';
+    mainError = '';
+    try {
+      await dispatch({ action: 'app-settings', payload: settings });
+      if (mounted && !await refreshAfterAction()) report('设置已保存，但最新状态尚未读回。');
+    } catch (error: unknown) {
+      report(error);
+    } finally {
+      if (mounted) busyAction = null;
+    }
+  }
+
+  async function cancelShutdown(): Promise<void> {
+    if (!mounted || cancellingShutdown) return;
+    cancellingShutdown = true;
+    shutdownError = '';
+    try {
+      await dispatch({ action: 'cancel-shutdown', payload: {} });
+      if (mounted && !await refreshAfterAction()) report('关机已取消，但最新状态尚未读回。');
+    } catch (error: unknown) {
+      if (mounted) shutdownError = `取消关机失败：${errorMessage(error)}`;
+    } finally {
+      if (mounted) cancellingShutdown = false;
     }
   }
 
@@ -441,6 +475,19 @@
         </div>
       </header>
 
+      {#if snapshot?.shutdownAt != null}
+        <section class="banner shutdown-banner" role="status" aria-label="自动关机提示">
+          <Icon name="power" size={20} />
+          <div class="banner-copy">
+            <strong>{shutdownSeconds > 0 ? `将在 ${shutdownSeconds} 秒后关机` : '关机倒计时已结束'}</strong><span>本轮任务已完成，可在关机前取消。</span>
+            {#if shutdownError}<p class="error" role="alert">{shutdownError}</p>{/if}
+          </div>
+          <div class="banner-actions">
+            <button type="button" class="secondary" disabled={cancellingShutdown} onclick={cancelShutdown}>{cancellingShutdown ? '正在取消…' : '取消关机'}</button>
+          </div>
+        </section>
+      {/if}
+
       {#if latestUpdate && latestUpdate.latestVersion !== dismissedVersion}
         <UpdateBanner update={latestUpdate} onopen={openLatestRelease}
           onclose={() => { dismissedVersion = latestUpdate?.latestVersion ?? ''; }} />
@@ -575,7 +622,18 @@
           </div>
           <h2 class="settings-section-title">应用与数据</h2>
           <div class="setting-row"><span class="setting-icon"><Icon name="folder" size={21} /></span><div class="setting-copy"><h3>本机记录目录</h3><p class="data-directory">{snapshot?.dataDir || '正在读取目录…'}</p></div><button type="button" class="secondary" disabled={utilityBusy !== null} onclick={() => utility('directory')}>打开目录</button></div>
-          <div class="setting-row"><span class="setting-icon"><Icon name="monitor" size={21} /></span><div class="setting-copy"><h3>关闭窗口时收起到托盘</h3><p>任务保持运行；需要完全退出时，使用下方的“退出应用”。</p></div><span class="setting-value">已启用</span></div>
+          <div class="setting-row"><span class="setting-icon"><Icon name="power" size={21} /></span><div class="setting-copy"><h3 id="shutdown-label">任务完成后自动关机</h3><p>本轮正常完成、停止加速并保存记录后，调用 shutdown.exe /s /t 30，30 秒后关机；手动停止、出错或任务未执行时不触发。</p></div>
+            <input type="checkbox" aria-labelledby="shutdown-label" checked={snapshot?.appSettings.shutdownAfterCompletion ?? false}
+              disabled={!snapshot || Boolean(stateError) || busyAction !== null || utilityBusy === 'exit'}
+              onchange={(event) => { if (snapshot) void saveAppSettings({ ...snapshot.appSettings, shutdownAfterCompletion: event.currentTarget.checked }); }} />
+          </div>
+          <div class="setting-row"><span class="setting-icon"><Icon name="monitor" size={21} /></span><div class="setting-copy"><h3 id="close-label">关闭窗口时</h3><p>进入后台会收起到托盘并继续任务；直接退出时，若任务尚未完成会先询问确认。</p></div>
+            <select aria-labelledby="close-label" value={snapshot?.appSettings.closeBehavior ?? 'background'}
+              disabled={!snapshot || Boolean(stateError) || busyAction !== null || utilityBusy === 'exit'}
+              onchange={(event) => { if (snapshot) void saveAppSettings({ ...snapshot.appSettings, closeBehavior: event.currentTarget.value === 'exit' ? 'exit' : 'background' }); }}>
+              <option value="background">进入后台</option><option value="exit">直接退出</option>
+            </select>
+          </div>
           <div class="setting-row"><span class="setting-icon"><Icon name="clock" size={21} /></span><div class="setting-copy"><h3>计时与任务规则</h3><p>同平台、同游戏、同区服合并计时。手机端、邀请和游戏内任务需手动完成。</p></div></div>
           <div class="setting-row"><span class="setting-icon"><Icon name="power" size={21} /></span><div class="setting-copy"><h3>退出应用</h3><p>由桌面后台确认退出、停止加速并保存记录。</p></div><button type="button" class="secondary" disabled={utilityBusy !== null} onclick={() => utility('exit')}>{utilityBusy === 'exit' ? '正在退出…' : '退出应用'}</button></div>
           <div class="about-app"><span class="app-symbol"><Icon name="arrow" size={20} /></span><strong>AutoBiubiu</strong><span>版本 {snapshot?.version || '0.3.3'} · 本地活动助手</span><p>让等待有个好结果。</p></div>
@@ -584,7 +642,7 @@
     </main>
   </div>
   <footer class="statusbar"><span class="statusbar-message" role="status"><span class="status-dot" class:active={runBusy}></span>
-    {#if snapshot?.operation || busyAction}正在{snapshot?.operation || ({ connect: '连接客户端', 'client-settings': '保存客户端设置', membership: '刷新会员信息', scan: '刷新活动', search: '搜索游戏', import: '导入活动', mapping: '保存设置', start: '启动所选活动', open: '打开活动', reconcile: '重新读取', 'stop-owned': '停止遗留加速' } as Record<string, string>)[busyAction ?? ''] || '处理请求'}…{:else}{runTitle}{/if}</span>
+    {#if snapshot?.operation || busyAction}正在{snapshot?.operation || ({ connect: '连接客户端', 'client-settings': '保存客户端设置', 'app-settings': '保存应用设置', membership: '刷新会员信息', scan: '刷新活动', search: '搜索游戏', import: '导入活动', mapping: '保存设置', start: '启动所选活动', open: '打开活动', reconcile: '重新读取', 'stop-owned': '停止遗留加速' } as Record<string, string>)[busyAction ?? ''] || '处理请求'}…{:else}{runTitle}{/if}</span>
     {#if page !== 'activities' && runBusy}<button type="button" class="status-stop" disabled={stopBusy || run?.status === 'stopping' || utilityBusy === 'exit'} onclick={stopTasks}>停止任务</button>{/if}
     <span class="statusbar-update">{snapshot?.updatedAt ? `更新于 ${formatTime(snapshot.updatedAt)}` : '尚未更新活动'}<span class="statusbar-zone"> · Asia/Shanghai</span></span>
   </footer>

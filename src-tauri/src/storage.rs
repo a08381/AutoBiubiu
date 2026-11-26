@@ -9,12 +9,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-const MIGRATION_FILES: [&str; 5] = [
+const MIGRATION_FILES: [&str; 6] = [
     "activities.json",
     "mappings.json",
     "run.json",
     "events.jsonl",
     "settings.json",
+    "app-settings.json",
 ];
 
 /// Clones share the write queue. An OS file lock also serializes separate instances.
@@ -429,6 +430,10 @@ mod tests {
             (
                 "settings.json",
                 r#"{"executablePath":"C:/x/biubiu.exe","debugPort":9222}"#,
+            ),
+            (
+                "app-settings.json",
+                r#"{"shutdownAfterCompletion":true,"closeBehavior":"exit"}"#,
             ),
         ];
         for (name, contents) in records {
